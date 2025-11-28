@@ -15,3 +15,7 @@
 4. How does HDMI handle robustness to different initial poses and headings?
 
    We randomize initial positions and headings during training. Door-opening starts roughly within a 20 cm translational range, while bread box transport uses about a 10 cm range. 
+
+5. Why link_pos/quat_w and com_lin/ang_vel for motion tracking rewards?
+
+   Getting link lin/ang vel from isaacsim is significantly slower than com lin/ang vel, so I use the latter for efficiency.
