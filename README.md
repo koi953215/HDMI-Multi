@@ -20,37 +20,30 @@
 
 </div>
 
-HDMI is a novel framework that enables humanoid robots to acquire diverse whole-body interaction skills directly from monocular RGB videos of human demonstrations.
-
-This repository contains the official training code of **HDMI: Learning Interactive Humanoid Whole-Body Control from Human Videos**.
-
-
-## TODO
-- [x] Release hdmi training code 
-- [x] hoi motion datasets
-- [x] Release pretrained models
-- [x] Release sim2real code
+HDMI is a framework that enables humanoid robots to acquire diverse whole-body interaction skills directly from monocular RGB videos of human demonstrations. This repository contains the official training code for **HDMI: Learning Interactive Humanoid Whole-Body Control from Human Videos**.
 
 
 ## 🚀 Quick Start
 
+Set up the environment, then install IsaacSim, IsaacLab, and HDMI:
+
 ```bash
-# setup conda environment
+# 1) Conda env
 conda create -n hdmi python=3.11 -y
 conda activate hdmi
 
-# install isaacsim
+# 2) IsaacSim
 pip install "isaacsim[all,extscache]==4.5.0" --extra-index-url https://pypi.nvidia.com
 isaacsim # test isaacsim
 
-# install isaaclab
+# 3) IsaacLab
 cd ..
 git clone git@github.com:isaac-sim/IsaacLab.git
 cd IsaacLab
 git checkout v2.2.0
 ./isaaclab.sh -i none
 
-# install hdmi
+# 4) HDMI
 cd ..
 git clone https://github.com/LeCAR-Lab/HDMI
 cd HDMI
@@ -60,26 +53,26 @@ pip install -e .
 ## Data Preparation
 
 ### Desired Data Format
-The training scripts load motion data from a `motion.npz` file (see `active_adaptation/utils/motion.py`). The archive stores a Python dict with the following keys and shapes (from [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)):
-- Body states: `pos`, `quat`, `lin_vel`, `ang_vel` with shape `[T, B, 3/4]`.
-- Joint states: `pos`, `vel` with shape `[T, J]`.
+The training scripts load motion data from `motion.npz` (see `active_adaptation/utils/motion.py`). The archive stores a Python dict with these keys/shapes (from [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)):
+- Body states: `pos`, `quat`, `lin_vel`, `ang_vel` → `[T, B, 3/4]`
+- Joint states: `pos`, `vel` → `[T, J]`
 
-`T` is the number of time steps, `B` is the number of bodies (including any objects you append), and `J` is the number of joints. The exact body and joint ordering is defined in the `meta.json` that sits alongside each `motion.npz`.
+`T` = time steps, `B` = bodies (including appended objects), `J` = joints. Body/joint ordering is defined in the accompanying `meta.json`.
 
 ### Processing Steps
-If you need to turn HOI/video data into this format (per the conversion outline in [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)), the workflow is:
-1) Convert human motion to robot motion using GVHMR → GMR/LocoMujoco to get robot body/joint states.
-2) Extract the object trajectory (with some heuristic rules).
-3) Append the object name to the body list in `meta.json`, then concatenate the object body states (`pos`, `quat`, `lin_vel`, `ang_vel`) to the robot body states so the resulting shapes will be `[T, B_robot + B_object, 3/4]`.
+To turn HOI/video data into this format (outline from [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)):
+1) Convert human motion to robot motion via GVHMR → GMR/LocoMujoco to obtain robot body/joint states.
+2) Extract the object trajectory (position, orientation, velocities).
+3) Append the object name to `meta.json`, then concatenate the object body states (`pos`, `quat`, `lin_vel`, `ang_vel`) to the robot body states so shapes become `[T, B_robot + B_object, 3/4]`.
 
 ### Verify Your Data
-You can add a `+task.command.record_motion=true` flag to any scripts to visualize the motion in Isaac Sim.
+Visualize motions in Isaac Sim with `+task.command.record_motion=true`:
 
 ```bash
 python scripts/train.py algo=ppo_roa_train task=G1/hdmi/move_suitcase +task.command.replay_motion=true
 ```
 
-You can also use the following script to visualize a `motion.npz` file in mujoco:
+Or visualize a `motion.npz` in MuJoCo:
 
 ```bash
 # one terminal
@@ -106,7 +99,7 @@ python scripts/train.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpo
 python scripts/play.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<student_wandb-run-path>
 ```
 
-To export trained policies add a `export_policy=true` flag to the play script.
+To export trained policies, add `export_policy=true` to the play script.
 
 
 ## Sim2Real
