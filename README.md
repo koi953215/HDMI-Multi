@@ -54,11 +54,13 @@ pip install -e .
 This codebase is designed to be a flexible, high-performance RL framework for Isaac Sim, built from composable MDP components, modular RL algorithms, and Hydra-driven configs. It relies on tensordict/torchrl for efficient data flow.
 
 - `active_adaptation/`
-  - `envs/` — unified base env with composable modular MDP components. See [Doc →](active_adaptation/envs/README.md).
-  - `learning/` — single-file PPO implementations used by HDMI. See [Doc →](active_adaptation/learning/README.md).
-- `scripts/` — training, evaluation, visualization entry points. See [Doc →](scripts/README.md).
+  - `envs/` — unified base env with composable modular MDP components: [Doc →](active_adaptation/envs/README.md).
+  - `learning/` — single-file PPO implementations: [Doc →](active_adaptation/learning/README.md).
+- `scripts/` — training, evaluation, visualization entry points: [Doc →](scripts/README.md).
 - `cfg/` — Hydra configs for tasks, algorithms, and app launch settings
 - `data/` — motion assets and samples referenced by configs
+
+HDMI-specific code is primarily in `active_adaptation/envs/mdp/commands/hdmi/` (commands, observations, rewards) and `active_adaptation/learning/ppo_roa.py` (PPO with residual action distillation).
 
 ## Data Preparation
 
