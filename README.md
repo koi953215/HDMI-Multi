@@ -29,7 +29,7 @@ Set up the environment, then install IsaacSim, IsaacLab, and HDMI:
 
 ```bash
 # 1) Conda env
-conda create -n hdmi python=3.11 -y
+conda create -n hdmi python=3.10 -y
 conda activate hdmi
 
 # 2) IsaacSim
@@ -49,6 +49,16 @@ git clone https://github.com/LeCAR-Lab/HDMI
 cd HDMI
 pip install -e .
 ```
+
+## Repository Structure
+This codebase is designed to be a flexible, high-performance RL framework for Isaac Sim, built from composable MDP components, modular RL algorithms, and Hydra-driven configs. It relies on tensordict/torchrl for efficient data flow.
+
+- `active_adaptation/`
+  - [envs/ →](active_adaptation/envs/README.md) unified base env with composable modular MDP components (actions, commands, observations, rewards, terminations)
+  - [learning/ →](active_adaptation/learning/README.md) single-file PPO variants used by HDMI
+- [scripts/ →](scripts/README.md) training, evaluation, visualization entry points
+- `cfg/` — Hydra configs for tasks, algorithms, and app launch settings
+- `data/` — motion assets and samples referenced by configs
 
 ## Data Preparation
 
@@ -85,22 +95,21 @@ python scripts/vis/motion_data_publisher.py <path-to-motion-folder>
 
 Teacher policy 
 ```bash
-# train policy
+# train teacher
 python scripts/train.py algo=ppo_roa_train task=G1/hdmi/move_suitcase
-# evaluate policy
-python scripts/play.py algo=ppo_roa_train task=G1/hdmi/move_suitcase checkpoint_path=run:<wandb-run-path>
+# evaluate teacher
+python scripts/play.py algo=ppo_roa_train task=G1/hdmi/move_suitcase checkpoint_path=run:<teacher-wandb_run_path>
 ```
 
 Student policy
 ```bash
-# train policy
-python scripts/train.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<teacher_wandb-run-path>
-# evaluate policy
-python scripts/play.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<student_wandb-run-path>
+# train student
+python scripts/train.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<teacher-wandb_run_path>
+# evaluate student
+python scripts/play.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<student-wandb_run_path>
 ```
 
 To export trained policies, add `export_policy=true` to the play script.
-
 
 ## Sim2Real
 
