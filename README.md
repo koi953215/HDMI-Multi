@@ -132,3 +132,7 @@ If you find our work useful for your research, please consider cite us:
       url={https://arxiv.org/abs/2509.16757}, 
 }
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=lecar-lab/hdmi&type=date&legend=top-left)](https://www.star-history.com/#lecar-lab/hdmi&type=date&legend=top-left)
