@@ -54,23 +54,23 @@ pip install -e .
 This codebase is designed to be a flexible, high-performance RL framework for Isaac Sim, built from composable MDP components, modular RL algorithms, and Hydra-driven configs. It relies on tensordict/torchrl for efficient data flow.
 
 - `active_adaptation/`
-  - [envs/ →](active_adaptation/envs/README.md) unified base env with composable modular MDP components (actions, commands, observations, rewards, terminations)
-  - [learning/ →](active_adaptation/learning/README.md) single-file PPO variants used by HDMI
-- [scripts/ →](scripts/README.md) training, evaluation, visualization entry points
+  - `envs/` — unified base env with composable modular MDP components. See [Doc →](active_adaptation/envs/README.md).
+  - `learning/` — single-file PPO implementations used by HDMI. See [Doc →](active_adaptation/learning/README.md).
+- `scripts/` — training, evaluation, visualization entry points. See [Doc →](scripts/README.md).
 - `cfg/` — Hydra configs for tasks, algorithms, and app launch settings
 - `data/` — motion assets and samples referenced by configs
 
 ## Data Preparation
 
 ### Desired Data Format
-The training scripts load motion data from `motion.npz` (see `active_adaptation/utils/motion.py`). The archive stores a Python dict with these keys/shapes (from [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)):
+The training scripts load motion data from `motion.npz` (see `active_adaptation/utils/motion.py`). The desired data format is as follows:
 - Body states: `pos`, `quat`, `lin_vel`, `ang_vel` → `[T, B, 3/4]`
 - Joint states: `pos`, `vel` → `[T, J]`
 
 `T` = time steps, `B` = bodies (including appended objects), `J` = joints. Body/joint ordering is defined in the accompanying `meta.json`.
 
 ### Processing Steps
-To turn HOI/video data into this format (outline from [issue #2](https://github.com/LeCAR-Lab/HDMI/issues/2)):
+To turn HOI/video data into this format:
 1) Convert human motion to robot motion via GVHMR → GMR/LocoMujoco to obtain robot body/joint states.
 2) Extract the object trajectory (position, orientation, velocities).
 3) Append the object name to `meta.json`, then concatenate the object body states (`pos`, `quat`, `lin_vel`, `ang_vel`) to the robot body states so shapes become `[T, B_robot + B_object, 3/4]`.
