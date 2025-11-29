@@ -2,12 +2,12 @@
 
 This folder holds the environment scaffolding that wires Isaac Sim/MuJoCo scenes to modular MDP components.
 
-## Core files
+## Files at a glance
 - `base.py` — top-level env class (`_Env`) that instantiates and orchestrates MDP pieces. It registers callbacks for `reset`, `pre_step`, `post_step`, `update`, and `debug_draw`.
 - `mdp/base.py` — base interfaces for MDP components (`Action`, `Command`, `Observation`, `Reward`, `Termination`). Components share a common lifecycle (`reset`, `step`, `update`) so the env can call them uniformly.
 - `mdp/` — concrete MDP modules for task specializations.
 
-## How MDP components are wired in `base.py`
+## Core Execution Flow
 - Commands: `command_manager.reset` runs on env reset; `command_manager.step` runs every step (registered as `pre_step`); `command_manager.debug_draw` runs when GUI is enabled.
 - Actions: `action_manager.reset` runs on reset; actions are applied during `step` after policy outputs are clipped/scaled.
 - Observations: each observation group is an `ObsGroup` that concatenates per-sensor builders; groups are cached and exposed via TorchRL specs.

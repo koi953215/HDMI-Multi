@@ -9,16 +9,10 @@ We provide single-file PPO algorithms built on TensorDict.
 - `common.py` — shared utilities (GAE, batching, MLP builders, normalization, key constants).
 - `critics.py` — critic helpers and value-network utilities reused across variants.
 
-## Common interface
+## Core Execution Flow
 - Rollout: `policy.get_rollout_policy(mode="train"|"eval")` returns the actor-only TensorDictModule used inside collectors/envs.
 - Learning: `policy.train_op(tensordict)` consumes a rollout TensorDict to compute advantages/returns (GAE), PPO losses, and apply an optimizer step.
 - State: `state_dict()/load_state_dict` cover actor, critic, and value norm (when enabled).
-
-`ppo_roa` adds phase-specific behaviors on top of this interface:
-- `phase=train` (`algo=ppo_roa_train`): encode privileged observations, train the main policy and the adaptation module; optionally enable **residual action distillation** (teacher = privileged policy, student = adapted policy).
-- `phase=adapt` / `phase=finetune` (`algo=ppo_roa_adapt|finetune`): run the adaptation module (GRU/MLP) and then an adapted actor; `finetune` also trains the adapter together with the actor.
-- `phase=train_est` / `phase=adapt_est`: attach a privileged estimator (e.g., depth/object features) and optionally a domain-randomization estimator.
-- Recurrent adapters: when `adapt_module="gru"`, the rollout policy also reads/writes `("next", "adapt_hx")` via a `TensorDictPrimer(reset_key="done")`.
 
 Typical TensorDict passed to `train_op` (structure from the collector):
 ```python
@@ -45,16 +39,6 @@ TensorDict(
   device=cuda:0,
 )
 ```
-
-For `ppo_roa`, the same structure is extended with additional keys such as:
-- command/object inputs (`CMD_KEY`, `OBJECT_KEY`, optional `DEPTH_KEY`)
-- adaptation features/targets (`PRIV_FEATURE_KEY`, `PRIV_PRED_KEY`, optional `priv_est`, `dr_pred`)
-- recurrent state when `adapt_module="gru"` (`("next", "adapt_hx")`).
-
-## Typical usage
-- Select the algorithm via Hydra: `algo=ppo` (vanilla), `algo=ppo_roa_train|adapt|finetune|*_est`, or `algo=ppo_amp`.
-- The training entrypoint (`scripts/train.py`) calls `policy.get_rollout_policy(...)` for sampling and `policy.train_op(...)` for updates.
-- Observation keys must match the variant’s `in_keys` (e.g., `ppo_roa` expects command + policy + object + priv keys; add depth if using `_est` configs).
 
 ## Extending
 To create a new variant:
