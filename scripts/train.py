@@ -47,7 +47,8 @@ def main(cfg: DictConfig):
 
     run = wandb.init(
         job_type=cfg.wandb.job_type,
-        project=cfg.wandb.project,
+        project="hdmi_tchen",
+        entity="tchen783-usc",
         mode=cfg.wandb.mode,
         tags=cfg.wandb.tags,
     )
