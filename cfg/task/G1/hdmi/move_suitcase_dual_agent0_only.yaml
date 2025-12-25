@@ -1,0 +1,9 @@
+# @package task
+
+defaults:
+  - move_suitcase_dual
+
+# Special termination mode: Only agent_0 can trigger environment reset
+# All other agents (agent_1, agent_2, ...) inherit agent_0's termination status
+# Use this for debugging or special training scenarios where agent_0 is the primary agent
+agent0_only_termination: true
