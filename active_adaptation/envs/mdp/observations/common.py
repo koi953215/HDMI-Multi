@@ -14,65 +14,143 @@ def random_noise(x: torch.Tensor, std: float):
 class root_ang_vel_history(Observation):
     def __init__(self, env, noise_std: float=0., history_steps: list[int]=[1]):
         super().__init__(env)
-        self.asset: Articulation = self.env.scene["robot"]
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
         self.noise_std = noise_std
         self.history_steps = history_steps
         buffer_size = max(history_steps) + 1
-        self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        self.buffer = torch.zeros((batch_size_total, buffer_size, 3), device=self.device)
         self.update()
     
     def reset(self, env_ids):
-        root_ang_vel_b = self.asset.data.root_ang_vel_b[env_ids]
-        root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
-        if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
-        self.buffer[env_ids] = root_ang_vel_b
+        if self.num_agents == 1:
+            root_ang_vel_b = self.asset.data.root_ang_vel_b[env_ids]
+            root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+            if self.noise_std > 0:
+                root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+            self.buffer[env_ids] = root_ang_vel_b
+        else:
+            # Multi-agent: collect from all robots and interleave
+            # Convert interleaved env_ids to physical env_ids
+            # env_ids are interleaved batch indices: [0, 1, 2, 3, ...] for [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
+            # We need physical env indices: [0, 1, ...] for the actual physical environments
+            physical_env_ids = torch.unique(env_ids // self.num_agents)
+
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                # Use physical_env_ids to access robot data
+                root_ang_vel_b = robot.data.root_ang_vel_b[physical_env_ids]
+                root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+                if self.noise_std > 0:
+                    root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+                # Interleaved indices for this agent: convert physical env_ids back to interleaved indices
+                interleaved_env_ids = physical_env_ids * self.num_agents + agent_id
+                self.buffer[interleaved_env_ids] = root_ang_vel_b
 
     def update(self):
-        root_ang_vel_b = self.asset.data.root_ang_vel_b
-        if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
-        self.buffer = self.buffer.roll(1, dims=1)
-        self.buffer[:, 0] = root_ang_vel_b
+        if self.num_agents == 1:
+            root_ang_vel_b = self.asset.data.root_ang_vel_b
+            if self.noise_std > 0:
+                root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+            self.buffer = self.buffer.roll(1, dims=1)
+            self.buffer[:, 0] = root_ang_vel_b
+        else:
+            # Multi-agent: collect from all robots and interleave
+            root_ang_vel_list = []
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                root_ang_vel_b = robot.data.root_ang_vel_b
+                if self.noise_std > 0:
+                    root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+                root_ang_vel_list.append(root_ang_vel_b)
+            # Interleave: [num_envs_per_agent, num_agents, 3] -> [batch_size_total, 3]
+            root_ang_vel_b = torch.stack(root_ang_vel_list, dim=1).reshape(-1, 3)
+            self.buffer = self.buffer.roll(1, dims=1)
+            self.buffer[:, 0] = root_ang_vel_b
 
     def compute(self) -> torch.Tensor:
-        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        return self.buffer[:, self.history_steps].reshape(batch_size_total, -1)
 
 class projected_gravity_history(Observation):
     def __init__(self, env, noise_std: float=0., history_steps: list[int]=[1]):
         super().__init__(env)
-        self.asset: Articulation = self.env.scene["robot"]
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
         self.noise_std = noise_std
         self.history_steps = history_steps
         buffer_size = max(history_steps) + 1
-        self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        self.buffer = torch.zeros((batch_size_total, buffer_size, 3), device=self.device)
         self.update()
-    
+
     def reset(self, env_ids):
-        projected_gravity_b = self.asset.data.projected_gravity_b[env_ids]
-        projected_gravity_b = projected_gravity_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
-        if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
-            projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
-        self.buffer[env_ids] = self.asset.data.projected_gravity_b[env_ids].unsqueeze(1)
-    
+        if self.num_agents == 1:
+            projected_gravity_b = self.asset.data.projected_gravity_b[env_ids]
+            projected_gravity_b = projected_gravity_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+            if self.noise_std > 0:
+                projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+                projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
+            self.buffer[env_ids] = self.asset.data.projected_gravity_b[env_ids].unsqueeze(1)
+        else:
+            # Multi-agent: collect from all robots and interleave
+            # Convert interleaved env_ids to physical env_ids
+            physical_env_ids = torch.unique(env_ids // self.num_agents)
+
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                # Use physical_env_ids to access robot data
+                projected_gravity_b = robot.data.projected_gravity_b[physical_env_ids]
+                projected_gravity_b = projected_gravity_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+                if self.noise_std > 0:
+                    projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+                    projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
+                # Interleaved indices for this agent: convert physical env_ids back to interleaved indices
+                interleaved_env_ids = physical_env_ids * self.num_agents + agent_id
+                self.buffer[interleaved_env_ids] = robot.data.projected_gravity_b[physical_env_ids].unsqueeze(1)
+
     def update(self):
-        projected_gravity_b = self.asset.data.projected_gravity_b
-        if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
-            projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
-        self.buffer = self.buffer.roll(1, dims=1)
-        self.buffer[:, 0] = projected_gravity_b
-    
+        if self.num_agents == 1:
+            projected_gravity_b = self.asset.data.projected_gravity_b
+            if self.noise_std > 0:
+                projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+                projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
+            self.buffer = self.buffer.roll(1, dims=1)
+            self.buffer[:, 0] = projected_gravity_b
+        else:
+            # Multi-agent: collect from all robots and interleave
+            projected_gravity_list = []
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                projected_gravity_b = robot.data.projected_gravity_b
+                if self.noise_std > 0:
+                    projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+                    projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
+                projected_gravity_list.append(projected_gravity_b)
+            # Interleave: [num_envs_per_agent, num_agents, 3] -> [batch_size_total, 3]
+            projected_gravity_b = torch.stack(projected_gravity_list, dim=1).reshape(-1, 3)
+            self.buffer = self.buffer.roll(1, dims=1)
+            self.buffer[:, 0] = projected_gravity_b
+
     def compute(self):
-        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        return self.buffer[:, self.history_steps].reshape(batch_size_total, -1)
 
 class joint_pos_history(Observation):
     def __init__(
         self,
         env,
         joint_names: str=".*",
-        history_steps: list[int]=[1], 
+        history_steps: list[int]=[1],
         noise_std: float=0.,
         set_to_zero_joint_names: str | None=None
     ):
@@ -80,11 +158,21 @@ class joint_pos_history(Observation):
         self.history_steps = history_steps
         self.buffer_size = max(history_steps) + 1
         self.noise_std = max(noise_std, 0.)
-        self.asset: Articulation = self.env.scene["robot"]
+
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
+
         from active_adaptation.envs.mdp.action import JointPosition
         action_manager: JointPosition = self.env.action_manager
         self.joint_pos_offset = action_manager.offset
-        self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
+
+        # Use first robot to get joint structure (all robots have same joints)
+        asset_for_joints = self.asset if self.num_agents == 1 else self.assets[0]
+        self.joint_ids, self.joint_names = asset_for_joints.find_joints(joint_names)
         self.num_joints = len(self.joint_ids)
         self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
         self.joint_mask = torch.ones(self.num_joints, device=self.device)
@@ -94,31 +182,56 @@ class joint_pos_history(Observation):
             self.joint_mask[set_to_zero_joint_ids] = 0.
         self.joint_mask = self.joint_mask.unsqueeze(0).unsqueeze(0) # [1, 1, J]
 
-        shape = (self.num_envs, self.buffer_size, self.num_joints)
-        self.joint_pos = torch.zeros(self.num_envs, 2, self.num_joints, device=self.device)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        shape = (batch_size_total, self.buffer_size, self.num_joints)
+        self.joint_pos = torch.zeros(batch_size_total, 2, self.num_joints, device=self.device)
         self.buffer = torch.zeros(shape, device=self.device)
-    
+
     def post_step(self, substep):
-        self.joint_pos[:, substep % 2] = self.asset.data.joint_pos[:, self.joint_ids]
-    
+        if self.num_agents == 1:
+            self.joint_pos[:, substep % 2] = self.asset.data.joint_pos[:, self.joint_ids]
+        else:
+            # Multi-agent: collect from all robots and interleave
+            joint_pos_list = []
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                joint_pos_list.append(robot.data.joint_pos[:, self.joint_ids])
+            # Interleave: [num_envs_per_agent, num_agents, num_joints] -> [batch_size_total, num_joints]
+            joint_pos_flat = torch.stack(joint_pos_list, dim=1).reshape(-1, self.num_joints)
+            self.joint_pos[:, substep % 2] = joint_pos_flat
+
     def reset(self, env_ids):
-        joint_pos = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)]
-        joint_pos2 = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
-        assert torch.allclose(joint_pos, joint_pos2)
-        self.buffer[env_ids] = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)].unsqueeze(1)
-    
+        if self.num_agents == 1:
+            joint_pos = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)]
+            joint_pos2 = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
+            assert torch.allclose(joint_pos, joint_pos2)
+            self.buffer[env_ids] = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)].unsqueeze(1)
+        else:
+            # Multi-agent: collect from all robots and interleave
+            # Convert interleaved env_ids to physical env_ids
+            physical_env_ids = torch.unique(env_ids // self.num_agents)
+
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                # Use physical_env_ids to access robot data
+                joint_pos = robot.data.joint_pos[physical_env_ids][:, self.joint_ids]
+                # Interleaved indices for this agent: convert physical env_ids back to interleaved indices
+                interleaved_env_ids = physical_env_ids * self.num_agents + agent_id
+                self.buffer[interleaved_env_ids] = joint_pos.unsqueeze(1)
+
     def update(self):
         self.buffer = self.buffer.roll(1, 1)
         joint_pos = self.joint_pos.mean(1)
         if self.noise_std > 0:
             joint_pos = random_noise(joint_pos, self.noise_std)
         self.buffer[:, 0] = joint_pos
-    
+
     def compute(self):
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
         joint_pos = self.buffer - self.joint_pos_offset[:, self.joint_ids].unsqueeze(1)
         joint_pos = joint_pos * self.joint_mask
         joint_pos_selected = joint_pos[:, self.history_steps]
-        return joint_pos_selected.reshape(self.num_envs, -1)
+        return joint_pos_selected.reshape(batch_size_total, -1)
  
 class prev_actions(Observation):
     def __init__(self, env, steps: int=1, flatten: bool=True, permute: bool=False):
@@ -127,13 +240,16 @@ class prev_actions(Observation):
         self.flatten = flatten
         self.permute = permute
         self.action_manager = self.env.action_manager
-    
+        # Multi-agent support: action_manager already handles flattened batch
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+
     def compute(self):
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
         action_buf = self.action_manager.action_buf[:, :, :self.steps].clone()
         if self.permute:
             action_buf = action_buf.permute(0, 2, 1)
         if self.flatten:
-            return action_buf.reshape(self.num_envs, -1)
+            return action_buf.reshape(batch_size_total, -1)
         else:
             return action_buf
 
@@ -147,8 +263,11 @@ class applied_action(Observation):
     def __init__(self, env):
         super().__init__(env)
         self.action_manager = self.env.action_manager
+        # Multi-agent support: action_manager already handles flattened batch
+        self.num_agents = getattr(self.env, 'num_agents', 1)
 
     def compute(self) -> torch.Tensor:
+        # action_manager.applied_action already has shape [batch_size_total, action_dim]
         return self.action_manager.applied_action
 
     def symmetry_transforms(self):
@@ -159,51 +278,114 @@ class applied_action(Observation):
 class applied_torque(Observation):
     def __init__(self, env, joint_names: str=".*"):
         super().__init__(env)
-        self.asset: Articulation = self.env.scene["robot"]
-        self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
-    
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
+
+        # Use first robot to get joint structure (all robots have same joints)
+        asset_for_joints = self.asset if self.num_agents == 1 else self.assets[0]
+        self.joint_ids, self.joint_names = asset_for_joints.find_joints(joint_names)
+
     def compute(self) -> torch.Tensor:
-        applied_efforts = self.asset.data.applied_torque
-        return applied_efforts[:, self.joint_ids]
-    
+        if self.num_agents == 1:
+            applied_efforts = self.asset.data.applied_torque
+            return applied_efforts[:, self.joint_ids]
+        else:
+            # Multi-agent: collect from all robots and interleave
+            applied_efforts_list = []
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                applied_efforts_list.append(robot.data.applied_torque[:, self.joint_ids])
+            # Interleave: [num_envs_per_agent, num_agents, num_joints] -> [batch_size_total, num_joints]
+            return torch.stack(applied_efforts_list, dim=1).reshape(-1, len(self.joint_ids))
+
     def symmetry_transforms(self):
-        transform = sym_utils.joint_space_symmetry(self.asset, self.joint_names)
+        asset_for_symmetry = self.asset if self.num_agents == 1 else self.assets[0]
+        transform = sym_utils.joint_space_symmetry(asset_for_symmetry, self.joint_names)
         return transform
 
 
 class last_contact(Observation):
     def __init__(self, env, body_names: str):
         super().__init__(env)
-        self.asset: Articulation = self.env.scene["robot"]
-        self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
-        self.articulation_body_ids = self.asset.find_bodies(body_names)[0]
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
 
+        if self.num_agents == 1:
+            self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
+        else:
+            # Multi-agent: use first agent's contact sensor to get body structure
+            self.contact_sensor = self.env.contact_sensors[0]
+
+        # Use first robot to get body structure (all robots have same bodies)
+        asset_for_bodies = self.asset if self.num_agents == 1 else self.assets[0]
+        self.articulation_body_ids = asset_for_bodies.find_bodies(body_names)[0]
         self.body_ids, self.body_names = self.contact_sensor.find_bodies(body_names)
 
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
         with torch.device(self.device):
             self.body_ids = torch.as_tensor(self.body_ids)
-            self.has_contact = torch.zeros(self.num_envs, len(self.body_ids), 1, dtype=bool)
-            self.last_contact_pos_w = torch.zeros(self.num_envs, len(self.body_ids), 3)
-        self.body_pos_w = self.asset.data.body_pos_w[:, self.articulation_body_ids]
-        
+            self.has_contact = torch.zeros(batch_size_total, len(self.body_ids), 1, dtype=bool)
+            self.last_contact_pos_w = torch.zeros(batch_size_total, len(self.body_ids), 3)
+
+        if self.num_agents == 1:
+            self.body_pos_w = self.asset.data.body_pos_w[:, self.articulation_body_ids]
+        else:
+            # Multi-agent: initialize with first agent's data (will be updated in update())
+            self.body_pos_w = torch.zeros(batch_size_total, len(self.articulation_body_ids), 3, device=self.device)
+
     def reset(self, env_ids: torch.Tensor):
-        self.has_contact[env_ids] = False
-    
+        if self.num_agents == 1:
+            self.has_contact[env_ids] = False
+        else:
+            # Multi-agent: reset all agents for given env_ids
+            # Convert interleaved env_ids to physical env_ids
+            physical_env_ids = torch.unique(env_ids // self.num_agents)
+
+            for agent_id in range(self.num_agents):
+                # Convert physical env_ids back to interleaved indices for this agent
+                interleaved_env_ids = physical_env_ids * self.num_agents + agent_id
+                self.has_contact[interleaved_env_ids] = False
+
     def update(self):
-        first_contact = self.contact_sensor.compute_first_contact(self.env.step_dt)[:, self.body_ids].unsqueeze(-1)
+        if self.num_agents == 1:
+            first_contact = self.contact_sensor.compute_first_contact(self.env.step_dt)[:, self.body_ids].unsqueeze(-1)
+            self.body_pos_w = self.asset.data.body_pos_w[:, self.articulation_body_ids]
+        else:
+            # Multi-agent: collect from all contact sensors and robots and interleave
+            first_contact_list = []
+            body_pos_list = []
+            for agent_id in range(self.num_agents):
+                contact_sensor = self.env.contact_sensors[agent_id]
+                robot = self.assets[agent_id]
+                first_contact_list.append(
+                    contact_sensor.compute_first_contact(self.env.step_dt)[:, self.body_ids].unsqueeze(-1)
+                )
+                body_pos_list.append(robot.data.body_pos_w[:, self.articulation_body_ids])
+            batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+            first_contact = torch.stack(first_contact_list, dim=1).reshape(batch_size_total, len(self.body_ids), 1)
+            self.body_pos_w = torch.stack(body_pos_list, dim=1).reshape(batch_size_total, len(self.articulation_body_ids), 3)
+
         self.has_contact.logical_or_(first_contact)
-        self.body_pos_w = self.asset.data.body_pos_w[:, self.articulation_body_ids]
         self.last_contact_pos_w = torch.where(
             first_contact,
             self.body_pos_w,
             self.last_contact_pos_w
         )
-    
+
     def compute(self):
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
         distance_xy = (self.body_pos_w[:, :, :2] - self.last_contact_pos_w[:, :, :2]).norm(dim=-1)
         distance_z = self.body_pos_w[:, :, 2] - self.last_contact_pos_w[:, :, 2]
         distance = torch.stack([distance_xy, distance_z], dim=-1)
-        return (distance * self.has_contact).reshape(self.num_envs, -1)
+        return (distance * self.has_contact).reshape(batch_size_total, -1)
 
     def debug_draw(self):
         if self.env.sim.has_gui() and self.env.backend == "isaac":
@@ -217,30 +399,49 @@ class jacobians_b(Observation):
     """The jacobians relative to the root link in body frame. The shape of returned jacobian is (num_envs, num_bodies * 6 * num_joints)"""
     def __init__(self, env, body_names: str, joint_names: str):
         super().__init__(env)
-        self.asset: Articulation = self.env.scene["robot"]
-        self.body_ids, self.body_names = self.asset.find_bodies(body_names)
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        if self.num_agents == 1:
+            self.asset: Articulation = self.env.scene["robot"]
+        else:
+            self.assets = self.env.robots
+
+        # Use first robot to get body/joint structure (all robots have same structure)
+        asset_for_structure = self.asset if self.num_agents == 1 else self.assets[0]
+        self.body_ids, self.body_names = asset_for_structure.find_bodies(body_names)
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
-        self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
+        self.joint_ids, self.joint_names = asset_for_structure.find_joints(joint_names)
         self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
         if self.env.fix_root_link:
             self.body_ids = self.body_ids - 1
         else:
             self.joint_ids = self.joint_ids + 6
-    
+
     def compute(self) -> torch.Tensor:
-        jacobian_all = self.asset.root_physx_view.get_jacobians() # [N, B, 6, J]
-        jacobian = jacobian_all[:, self.body_ids.unsqueeze(1), :, self.joint_ids.unsqueeze(0)].permute(2, 0, 3, 1) # [N, b, j, 6]
-        root_quat_w = self.asset.data.root_quat_w # [N, 4]
-        # [N, b, 6, j] -> [N, b, j, 6] -> [N, b * j * 2, 3] then rotate
-        jacobian_b = jacobian.permute(0, 1, 3, 2).reshape(self.num_envs, -1, 3)
-        jacobian_b = quat_apply_inverse(root_quat_w.unsqueeze(1), jacobian_b)
-
-        # # [N, b * j * 2, 3] -> [N, b * j, 6] -> [N, b, j, 6] -> [N, b, 6, j]
-        # jacobian_b = jacobian_b.reshape(self.num_envs, len(self.body_ids), -1, 6).permute(0, 1, 3, 2)
-        # arm_joint_ids, _ = self.asset.find_joints("arm_joint[1-6]")
-        # breakpoint()
-
-        return jacobian_b.reshape(self.num_envs, -1)
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        if self.num_agents == 1:
+            jacobian_all = self.asset.root_physx_view.get_jacobians() # [N, B, 6, J]
+            jacobian = jacobian_all[:, self.body_ids.unsqueeze(1), :, self.joint_ids.unsqueeze(0)].permute(2, 0, 3, 1) # [N, b, j, 6]
+            root_quat_w = self.asset.data.root_quat_w # [N, 4]
+            # [N, b, 6, j] -> [N, b, j, 6] -> [N, b * j * 2, 3] then rotate
+            jacobian_b = jacobian.permute(0, 1, 3, 2).reshape(self.num_envs, -1, 3)
+            jacobian_b = quat_apply_inverse(root_quat_w.unsqueeze(1), jacobian_b)
+            return jacobian_b.reshape(self.num_envs, -1)
+        else:
+            # Multi-agent: collect from all robots and interleave
+            jacobian_b_list = []
+            for agent_id in range(self.num_agents):
+                robot = self.assets[agent_id]
+                jacobian_all = robot.root_physx_view.get_jacobians() # [N, B, 6, J]
+                jacobian = jacobian_all[:, self.body_ids.unsqueeze(1), :, self.joint_ids.unsqueeze(0)].permute(2, 0, 3, 1)
+                root_quat_w = robot.data.root_quat_w
+                num_envs_per_agent = root_quat_w.shape[0]
+                jacobian_b = jacobian.permute(0, 1, 3, 2).reshape(num_envs_per_agent, -1, 3)
+                jacobian_b = quat_apply_inverse(root_quat_w.unsqueeze(1), jacobian_b)
+                jacobian_b_list.append(jacobian_b)
+            # Interleave: [num_envs_per_agent, num_agents, ...] -> [batch_size_total, ...]
+            jacobian_b = torch.stack(jacobian_b_list, dim=1).reshape(batch_size_total, -1, 3)
+            return jacobian_b.reshape(batch_size_total, -1)
 
 
 class random_noise_placeholder(Observation):

@@ -8,9 +8,10 @@ from active_adaptation.envs.base import _Env
 
 class SimpleEnv(_Env):
     def __init__(self, cfg):
+        # NOTE: self.robots is set in setup_scene() which is called by super().__init__()
+        # This ensures robots are available when observation components are initialized
         super().__init__(cfg)
-        self.robot = self.scene.articulations["robot"]
-        
+
         if self.backend == "isaac" and self.sim.has_gui():
             from isaaclab.envs.ui import BaseEnvWindow, ViewportCameraController
             from isaaclab.envs import ViewerCfg
@@ -48,6 +49,9 @@ class SimpleEnv(_Env):
             from active_adaptation.assets import ROBOTS, OBJECTS, get_asset_meta
             from active_adaptation.envs.terrain import TERRAINS
             
+            # Multi-agent support
+            num_agents = self.cfg.get("num_agents", 1)
+
             env_spacing = self.cfg.viewer.get("env_spacing", 2.0)
             scene_cfg = InteractiveSceneCfg(num_envs=self.cfg.num_envs, env_spacing=env_spacing, replicate_physics=False)
             scene_cfg.sky_light = AssetBaseCfg(
@@ -57,15 +61,37 @@ class SimpleEnv(_Env):
                     texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
                 ),
             )
-            scene_cfg.robot: ArticulationCfg = ROBOTS[self.cfg.robot.name]
-            
-            if hasattr(self.cfg.robot, 'override_params'):
-                from active_adaptation.utils import update_class_from_dict
-                update_class_from_dict(scene_cfg.robot, self.cfg.robot.override_params, _ns="")
-            
-            scene_cfg.robot.prim_path = "{ENV_REGEX_NS}/Robot"
-            robot_type = self.cfg.robot.get("robot_type", self.cfg.robot.name)
-            scene_cfg.robot.spawn.usd_path = scene_cfg.robot.spawn.usd_path.format(ROBOT_TYPE=robot_type)
+
+            # Create robots for each agent
+            if num_agents == 1:
+                # Single agent (original behavior)
+                scene_cfg.robot: ArticulationCfg = ROBOTS[self.cfg.robot.name]
+
+                if hasattr(self.cfg.robot, 'override_params'):
+                    from active_adaptation.utils import update_class_from_dict
+                    update_class_from_dict(scene_cfg.robot, self.cfg.robot.override_params, _ns="")
+
+                scene_cfg.robot.prim_path = "{ENV_REGEX_NS}/Robot"
+                robot_type = self.cfg.robot.get("robot_type", self.cfg.robot.name)
+                scene_cfg.robot.spawn.usd_path = scene_cfg.robot.spawn.usd_path.format(ROBOT_TYPE=robot_type)
+            else:
+                # Multi-agent: create separate robot config for each agent
+                import copy
+                for agent_id in range(num_agents):
+                    robot_cfg: ArticulationCfg = copy.deepcopy(ROBOTS[self.cfg.robot.name])
+
+                    if hasattr(self.cfg.robot, 'override_params'):
+                        from active_adaptation.utils import update_class_from_dict
+                        update_class_from_dict(robot_cfg, self.cfg.robot.override_params, _ns="")
+
+                    robot_cfg.prim_path = f"{{ENV_REGEX_NS}}/Robot_{agent_id}"
+                    robot_type = self.cfg.robot.get("robot_type", self.cfg.robot.name)
+                    robot_cfg.spawn.usd_path = robot_cfg.spawn.usd_path.format(ROBOT_TYPE=robot_type)
+
+                    setattr(scene_cfg, f"robot_{agent_id}", robot_cfg)
+
+                # Keep backward compatibility reference to first robot
+                scene_cfg.robot = getattr(scene_cfg, "robot_0")
 
             # if self.cfg.command._target_ == "active_adaptation.envs.mdp.commands.hdmi.command.RobotObjectTracking":
             if "object_asset_name" in self.cfg.command:
@@ -78,26 +104,55 @@ class SimpleEnv(_Env):
                 obj_name = self.cfg.command.object_asset_name
                 obj_contact_body_name = self.cfg.command.object_body_name
 
-                obj_cfg = OBJECTS[obj_name]
-                obj_cfg.prim_path = "{ENV_REGEX_NS}/" + obj_name
-                obj_type = self.cfg.command.get("object_type", obj_name)
-                obj_cfg.spawn.usd_path = obj_cfg.spawn.usd_path.format(OBJECT_TYPE=obj_type)
-                print(f"Using object type {obj_type} with asset {obj_cfg.spawn.usd_path}")
-                setattr(scene_cfg, obj_name, obj_cfg)
+                if num_agents == 1:
+                    # Single agent (original behavior)
+                    obj_cfg = OBJECTS[obj_name]
+                    obj_cfg.prim_path = "{ENV_REGEX_NS}/" + obj_name
+                    obj_type = self.cfg.command.get("object_type", obj_name)
+                    obj_cfg.spawn.usd_path = obj_cfg.spawn.usd_path.format(OBJECT_TYPE=obj_type)
+                    print(f"Using object type {obj_type} with asset {obj_cfg.spawn.usd_path}")
+                    setattr(scene_cfg, obj_name, obj_cfg)
 
-                # add contact sensor to the box
-                eef_names = self.cfg.command.get("contact_eef_body_name", [])
-                contact_geom_prim_path = "{ENV_REGEX_NS}/" + obj_name + "/" + obj_contact_body_name
+                    # add contact sensor to the box
+                    eef_names = self.cfg.command.get("contact_eef_body_name", [])
+                    contact_geom_prim_path = "{ENV_REGEX_NS}/" + obj_name + "/" + obj_contact_body_name
 
-                for eef_name in eef_names:
-                    contact_sensor_name = f"{eef_name}_{obj_name}_contact_forces"
-                    eef_prim_path = "{ENV_REGEX_NS}/Robot/" + eef_name
-                    setattr(scene_cfg, contact_sensor_name, ContactSensorCfg(
-                        prim_path=eef_prim_path,
-                        history_length=0,
-                        track_air_time=False,
-                        filter_prim_paths_expr=[contact_geom_prim_path],
-                    ))
+                    for eef_name in eef_names:
+                        contact_sensor_name = f"{eef_name}_{obj_name}_contact_forces"
+                        eef_prim_path = "{ENV_REGEX_NS}/Robot/" + eef_name
+                        setattr(scene_cfg, contact_sensor_name, ContactSensorCfg(
+                            prim_path=eef_prim_path,
+                            history_length=0,
+                            track_air_time=False,
+                            filter_prim_paths_expr=[contact_geom_prim_path],
+                        ))
+                else:
+                    # Multi-agent: create separate object for each agent
+                    import copy
+                    for agent_id in range(num_agents):
+                        obj_cfg = copy.deepcopy(OBJECTS[obj_name])
+                        obj_cfg.prim_path = f"{{ENV_REGEX_NS}}/{obj_name}_{agent_id}"
+                        obj_type = self.cfg.command.get("object_type", obj_name)
+                        obj_cfg.spawn.usd_path = obj_cfg.spawn.usd_path.format(OBJECT_TYPE=obj_type)
+                        print(f"Agent {agent_id}: Using object type {obj_type} with asset {obj_cfg.spawn.usd_path}")
+                        setattr(scene_cfg, f"{obj_name}_{agent_id}", obj_cfg)
+
+                        # Add contact sensors for this agent's robot-object pair
+                        eef_names = self.cfg.command.get("contact_eef_body_name", [])
+                        contact_geom_prim_path = f"{{ENV_REGEX_NS}}/{obj_name}_{agent_id}/{obj_contact_body_name}"
+
+                        for eef_name in eef_names:
+                            contact_sensor_name = f"{eef_name}_{obj_name}_{agent_id}_contact_forces"
+                            eef_prim_path = f"{{ENV_REGEX_NS}}/Robot_{agent_id}/" + eef_name
+                            setattr(scene_cfg, contact_sensor_name, ContactSensorCfg(
+                                prim_path=eef_prim_path,
+                                history_length=0,
+                                track_air_time=False,
+                                filter_prim_paths_expr=[contact_geom_prim_path],
+                            ))
+
+                    # Keep backward compatibility reference to first object
+                    setattr(scene_cfg, obj_name, getattr(scene_cfg, f"{obj_name}_0"))
                     
             body_scale_rand = self.cfg.randomization.get("body_scale", None)
             if body_scale_rand is not None:
@@ -110,11 +165,25 @@ class SimpleEnv(_Env):
                 print(f"Randomized {body_scale_rand.name} scale to {asset.spawn.scale_range}")
 
             scene_cfg.terrain = TERRAINS[self.cfg.terrain]
-            scene_cfg.contact_forces = ContactSensorCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/.*(ankle_roll|wrist_.*)_link", 
-                history_length=3,
-                track_air_time=True
-            )
+            # Multi-agent support: create separate contact sensors for each agent
+            if num_agents == 1:
+                contact_prim_path = "{ENV_REGEX_NS}/Robot/.*(ankle_roll|wrist_.*)_link"
+                scene_cfg.contact_forces = ContactSensorCfg(
+                    prim_path=contact_prim_path,
+                    history_length=3,
+                    track_air_time=True
+                )
+            else:
+                # For multi-agent, create separate contact sensor for each agent
+                for agent_id in range(num_agents):
+                    contact_prim_path = f"{{ENV_REGEX_NS}}/Robot_{agent_id}/.*(ankle_roll|wrist_.*)_link"
+                    setattr(scene_cfg, f"contact_forces_{agent_id}", ContactSensorCfg(
+                        prim_path=contact_prim_path,
+                        history_length=3,
+                        track_air_time=True
+                    ))
+                # Keep backward compatibility reference to first agent's sensor
+                scene_cfg.contact_forces = scene_cfg.contact_forces_0
 
             if self.cfg.get("enable_cameras", False):
                 from isaaclab.sensors import TiledCameraCfg
@@ -239,14 +308,37 @@ class SimpleEnv(_Env):
             self.scene = MJScene(SceneCfg())
             self.sim = MJSim(self.scene)
 
-        
+        # Multi-agent support: Set self.robots immediately after scene creation
+        # This MUST happen in setup_scene() before base.__init__() creates observation components
+        num_agents = self.cfg.get("num_agents", 1)
+        if num_agents == 1:
+            # Single agent (original behavior)
+            self.robot = self.scene.articulations["robot"]
+            self.robots = [self.robot]  # For uniform access
+            self.contact_sensors = [self.scene.sensors["contact_forces"]]
+        else:
+            # Multi-agent: store each robot articulation and contact sensor
+            self.robots = [self.scene.articulations[f"robot_{i}"] for i in range(num_agents)]
+            self.robot = self.robots[0]  # Keep backward compatibility reference
+            self.contact_sensors = [self.scene.sensors[f"contact_forces_{i}"] for i in range(num_agents)]
+
+
     def _reset_idx(self, env_ids: torch.Tensor):
+        # NOTE: command_manager.sample_init() handles robot state initialization internally
+        # For single-agent: it returns init_root_state that we can optionally write
+        # For multi-agent: it returns None and writes states directly to each robot
         init_root_state = self.command_manager.sample_init(env_ids)
+
+        # Only write states if sample_init() returns them (single-agent legacy path)
         if init_root_state is not None and not self.robot.is_fixed_base:
+            # Single agent: write directly
             self.robot.write_root_state_to_sim(
-                init_root_state, 
+                init_root_state,
                 env_ids=env_ids
             )
+        # Multi-agent: command_manager.sample_init() already handled state writes internally,
+        # no additional writes needed here
+
         self.stats[env_ids] = 0.
 
     def render(self, mode: str="human"):

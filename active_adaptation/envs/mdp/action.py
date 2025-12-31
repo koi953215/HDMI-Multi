@@ -19,6 +19,10 @@ class ActionManager:
         self.asset: Articulation = self.env.scene["robot"]
         self.action_buf: torch.Tensor
 
+        # Multi-agent support
+        self.num_agents = getattr(self.env, 'num_agents', 1)
+        self.batch_size_total = getattr(self.env, 'batch_size_total', self.env.num_envs)
+
     def reset(self, env_ids: torch.Tensor):
         pass
 
@@ -65,16 +69,24 @@ class JointPosition(ActionManager):
             raise ValueError(f"Invalid alpha type: {type(alpha)}")
 
         self.default_joint_pos = self.asset.data.default_joint_pos.clone()
-        self.offset = torch.zeros_like(self.default_joint_pos)
 
+        # Multi-agent: offset should have batch_size_total (flattened batch dimension)
+        if self.num_agents == 1:
+            self.offset = torch.zeros_like(self.default_joint_pos)
+        else:
+            # Create offset with shape [batch_size_total, num_joints]
+            num_joints = self.default_joint_pos.shape[1]
+            self.offset = torch.zeros(self.batch_size_total, num_joints, device=self.device)
+
+        # Multi-agent: Use batch_size_total for all action buffers (flattened batch dimension)
         with torch.device(self.device):
             action_buf_hist = max((self.max_delay - 1) // self.env.decimation + 1, 3)
             self.action_buf = torch.zeros(
-                self.num_envs, self.action_dim, action_buf_hist
+                self.batch_size_total, self.action_dim, action_buf_hist
             )  # at least 3 for action_rate_2_l2 reward
-            self.applied_action = torch.zeros(self.num_envs, self.action_dim)
-            self.alpha = torch.ones(self.num_envs, 1)
-            self.delay = torch.zeros(self.num_envs, 1, dtype=int)
+            self.applied_action = torch.zeros(self.batch_size_total, self.action_dim)
+            self.alpha = torch.ones(self.batch_size_total, 1)
+            self.delay = torch.zeros(self.batch_size_total, 1, dtype=int)
 
     def resolve(self, spec):
         return string_utils.resolve_matching_names_values(dict(spec), self.asset.joint_names)
@@ -114,7 +126,28 @@ class JointPosition(ActionManager):
         action = self.action_buf.take_along_dim(action_dim.unsqueeze(1), dim=-1)
         self.applied_action.lerp_(action.squeeze(-1), self.alpha)
 
-        pos_target = self.default_joint_pos + self.offset
-        pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
-        self.asset.set_joint_position_target(pos_target)
+        # Multi-agent: Distribute actions to corresponding robots
+        if self.num_agents == 1:
+            # Single agent: use original logic
+            pos_target = self.default_joint_pos + self.offset
+            pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
+            self.asset.set_joint_position_target(pos_target)
+        else:
+            # Multi-agent: distribute flattened actions to each robot
+            # Flattened ordering: [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
+            for agent_id in range(self.num_agents):
+                # Extract agent's actions: [agent_id, agent_id + num_agents, agent_id + 2*num_agents, ...]
+                agent_indices = torch.arange(agent_id, self.batch_size_total, self.num_agents, device=self.device)
+                agent_applied_action = self.applied_action[agent_indices]  # [num_envs_per_agent, action_dim]
+                agent_offset = self.offset[agent_indices]  # [num_envs_per_agent, num_joints]
+
+                # Get agent's robot
+                robot = self.env.robots[agent_id]
+
+                # Compute target position for this agent (with offset support)
+                pos_target = robot.data.default_joint_pos + agent_offset
+                pos_target[:, self.joint_ids] += agent_applied_action * self.action_scaling
+
+                # Set target for this agent's robot
+                robot.set_joint_position_target(pos_target)
         

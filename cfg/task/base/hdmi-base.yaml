@@ -10,8 +10,12 @@ viewer:
 
 terrain: plane
 
-num_envs: 4096
+num_envs: 2048
+num_agents: 1  # Number of independent agents per environment (1=single agent, 2+=multi-agent iPPO)
 max_episode_length: 1000
+
+# Multi-agent termination strategy
+agent0_only_termination: false  # If true, only agent_0's termination triggers environment reset (all other agents inherit agent_0's done status)
 
 sim:
   step_dt: 0.02

@@ -27,22 +27,30 @@ class object_body_randomization(RobotObjectTrackRandomization ):
         if static_friction_range is None and static_dynamic_friction_ratio_range is None:
             raise ValueError("Must specify either static_friction_range or static_dynamic_friction_ratio_range")
         
-        self.object = self.command_manager.object
+        # Multi-agent support: get all objects
+        num_agents = getattr(self.env, 'num_agents', 1)
+        if num_agents == 1:
+            self.objects = [self.command_manager.object]
+        else:
+            self.objects = []
+            object_asset_name = self.command_manager.object_asset_name
+            for agent_id in range(num_agents):
+                object_name = f"{object_asset_name}_{agent_id}"
+                # Try rigid_objects first, then articulations
+                if object_name in self.env.scene.rigid_objects:
+                    self.objects.append(self.env.scene.rigid_objects[object_name])
+                elif object_name in self.env.scene.articulations:
+                    self.objects.append(self.env.scene.articulations[object_name])
+                else:
+                    raise ValueError(f"Object {object_name} not found in scene")
 
         self.mass_range = mass_range
-
-        self.all_indices_cpu = torch.arange(self.object.num_instances)
-
-        # randomize all shapes of the object
-        max_shapes = self.object.root_physx_view.max_shapes
-        self.shape_ids = torch.arange(0, max_shapes) 
-
         self.num_buckets = 64
-        
+
         # Sample dynamic friction and restitution buckets
         self.dynamic_friction_buckets = sample_uniform(*tuple(dynamic_friction_range), (self.num_buckets,), "cpu")
         self.restitution_buckets = sample_uniform(*tuple(restitution_range), (self.num_buckets,), "cpu")
-        
+
         # Handle static friction based on which parameter is specified
         if static_friction_range is not None:
             self.static_friction_buckets = sample_uniform(*tuple(static_friction_range), (self.num_buckets,), "cpu")
@@ -50,37 +58,45 @@ class object_body_randomization(RobotObjectTrackRandomization ):
             self.static_dynamic_friction_ratio_buckets = sample_uniform(*tuple(static_dynamic_friction_ratio_range), (self.num_buckets,), "cpu")
 
     def startup(self):
-        masses = self.object.data.default_mass.clone()
-        inertias = self.object.data.default_inertia.clone()
-        new_masses = sample_uniform(*self.mass_range, masses.shape, "cpu")
+        # Apply randomization to each object independently
+        for obj in self.objects:
+            all_indices_cpu = torch.arange(obj.num_instances)
+            max_shapes = obj.root_physx_view.max_shapes
+            shape_ids = torch.arange(0, max_shapes)
 
-        scale = new_masses / masses
-        masses[:] *= scale
-        if inertias.ndim == 2:
-            inertias[:] *= scale
-        elif inertias.ndim == 3:
-            inertias[:] *= scale.unsqueeze(-1)
-        else:
-            raise ValueError(f"Invalid shape for inertias: {inertias.shape}")
-        self.object.root_physx_view.set_masses(masses, self.all_indices_cpu)
-        self.object.root_physx_view.set_inertias(inertias, self.all_indices_cpu)
-        assert torch.allclose(self.object.root_physx_view.get_masses(), masses, atol=1e-4)
-        assert torch.allclose(self.object.root_physx_view.get_inertias(), inertias, atol=1e-4)
+            # Mass and inertia randomization
+            masses = obj.data.default_mass.clone()
+            inertias = obj.data.default_inertia.clone()
+            new_masses = sample_uniform(*self.mass_range, masses.shape, "cpu")
 
-        materials = self.object.root_physx_view.get_material_properties().clone()
-        shape = (self.object.num_instances, 1)
-        dynamic_friction = self.dynamic_friction_buckets[torch.randint(0, self.num_buckets, shape)]
-        restitution = self.restitution_buckets[torch.randint(0, self.num_buckets, shape)]
-        if hasattr(self, "static_friction_buckets"):
-            static_friction = self.static_friction_buckets[torch.randint(0, self.num_buckets, shape)]
-        else:
-            static_friction_ratio = self.static_dynamic_friction_ratio_buckets[torch.randint(0, self.num_buckets, shape)]
-            static_friction = dynamic_friction * static_friction_ratio
-        materials[:, self.shape_ids, 0] = static_friction
-        materials[:, self.shape_ids, 1] = dynamic_friction
-        materials[:, self.shape_ids, 2] = restitution
-        self.object.root_physx_view.set_material_properties(materials.flatten(), self.all_indices_cpu)
-        assert torch.allclose(self.object.root_physx_view.get_material_properties(), materials, atol=1e-4)
+            scale = new_masses / masses
+            masses[:] *= scale
+            if inertias.ndim == 2:
+                inertias[:] *= scale
+            elif inertias.ndim == 3:
+                inertias[:] *= scale.unsqueeze(-1)
+            else:
+                raise ValueError(f"Invalid shape for inertias: {inertias.shape}")
+            obj.root_physx_view.set_masses(masses, all_indices_cpu)
+            obj.root_physx_view.set_inertias(inertias, all_indices_cpu)
+            assert torch.allclose(obj.root_physx_view.get_masses(), masses, atol=1e-4)
+            assert torch.allclose(obj.root_physx_view.get_inertias(), inertias, atol=1e-4)
+
+            # Material properties randomization
+            materials = obj.root_physx_view.get_material_properties().clone()
+            shape = (obj.num_instances, 1)
+            dynamic_friction = self.dynamic_friction_buckets[torch.randint(0, self.num_buckets, shape)]
+            restitution = self.restitution_buckets[torch.randint(0, self.num_buckets, shape)]
+            if hasattr(self, "static_friction_buckets"):
+                static_friction = self.static_friction_buckets[torch.randint(0, self.num_buckets, shape)]
+            else:
+                static_friction_ratio = self.static_dynamic_friction_ratio_buckets[torch.randint(0, self.num_buckets, shape)]
+                static_friction = dynamic_friction * static_friction_ratio
+            materials[:, shape_ids, 0] = static_friction
+            materials[:, shape_ids, 1] = dynamic_friction
+            materials[:, shape_ids, 2] = restitution
+            obj.root_physx_view.set_material_properties(materials.flatten(), all_indices_cpu)
+            assert torch.allclose(obj.root_physx_view.get_material_properties(), materials, atol=1e-4)
 
 class object_joint_randomization(RobotObjectTrackRandomization):
     def __init__(
@@ -93,7 +109,22 @@ class object_joint_randomization(RobotObjectTrackRandomization):
         super().__init__(**kwargs)
         if TYPE_CHECKING:
             from active_adaptation.assets.objects import CustomArticulation
-        self.object: CustomArticulation = self.command_manager.object
+
+        # Multi-agent support: get all articulated objects
+        num_agents = getattr(self.env, 'num_agents', 1)
+        if num_agents == 1:
+            self.objects = [self.command_manager.object]
+        else:
+            self.objects = []
+            object_asset_name = self.command_manager.object_asset_name
+            for agent_id in range(num_agents):
+                object_name = f"{object_asset_name}_{agent_id}"
+                # Object must be an articulation for joint randomization
+                if object_name in self.env.scene.articulations:
+                    self.objects.append(self.env.scene.articulations[object_name])
+                else:
+                    raise ValueError(f"Articulated object {object_name} not found in scene")
+
         self.friction_range = friction_range
         self.damping_range = damping_range
         self.armature_range = armature_range
@@ -101,15 +132,19 @@ class object_joint_randomization(RobotObjectTrackRandomization):
         self.joint_id_asset = 0
     
     def startup(self):
-        door_armature = sample_uniform(*self.armature_range, (self.object.num_instances, 1), self.device)
-        self.object.write_joint_armature_to_sim(door_armature, joint_ids=[self.joint_id_asset])
+        # Apply randomization to each articulated object independently
+        for obj in self.objects:
+            door_armature = sample_uniform(*self.armature_range, (obj.num_instances, 1), self.device)
+            obj.write_joint_armature_to_sim(door_armature, joint_ids=[self.joint_id_asset])
 
     def reset(self, env_ids: torch.Tensor):
-        joint_friction = sample_uniform(*self.friction_range, (len(env_ids),), self.device)
-        joint_damping = sample_uniform(*self.damping_range, (len(env_ids),), self.device)
+        # Apply randomization to each articulated object independently
+        for obj in self.objects:
+            joint_friction = sample_uniform(*self.friction_range, (len(env_ids),), self.device)
+            joint_damping = sample_uniform(*self.damping_range, (len(env_ids),), self.device)
 
-        self.object._custom_friction[env_ids] = joint_friction
-        self.object._custom_damping[env_ids] = joint_damping
+            obj._custom_friction[env_ids] = joint_friction
+            obj._custom_damping[env_ids] = joint_damping
 
 # class keypoint_virtual_force(RobotTrackRandomization):
 #     def __init__(

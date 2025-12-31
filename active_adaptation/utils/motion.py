@@ -189,8 +189,52 @@ class MotionDataset:
         return self
 
     @classmethod
-    def create_from_path(cls, root_path: str | List[str], isaac_joint_names: List[str] | None = None, target_fps: int = 50, memory_mapped: bool = False):
+    def create_from_path(cls, root_path: str | List[str], isaac_joint_names: List[str] | None = None, target_fps: int = 50, memory_mapped: bool = False, num_agents: int = 1):
+        """
+        Load motion dataset(s) from path.
+
+        Args:
+            root_path: Path to motion data directory
+            isaac_joint_names: Joint names for remapping
+            target_fps: Target frame rate for interpolation
+            memory_mapped: Use memory-mapped tensors
+            num_agents: Number of agents (1=single agent, >1=multi-agent with agent_0/, agent_1/, ...)
+
+        Returns:
+            MotionDataset (if num_agents=1) or List[MotionDataset] (if num_agents>1)
+        """
         import active_adaptation
+
+        # Multi-agent: load datasets from agent_0/, agent_1/, ... subdirectories
+        if num_agents > 1:
+            if not isinstance(root_path, str):
+                raise ValueError(f"Multi-agent loading only supports single root_path string, got {type(root_path)}")
+
+            base_dir = Path(root_path) if Path(root_path).is_absolute() else Path(active_adaptation.__file__).parent.parent / root_path
+
+            if not base_dir.exists():
+                raise RuntimeError(f"Root path {base_dir} does not exist")
+
+            datasets = []
+            for agent_id in range(num_agents):
+                agent_path = base_dir / f"agent_{agent_id}"
+                if not agent_path.exists():
+                    raise RuntimeError(f"Agent path {agent_path} does not exist for agent {agent_id}/{num_agents}")
+
+                # Recursively call with num_agents=1 for each agent
+                dataset = cls.create_from_path(
+                    str(agent_path),
+                    isaac_joint_names=isaac_joint_names,
+                    target_fps=target_fps,
+                    memory_mapped=memory_mapped,
+                    num_agents=1  # Each agent dataset is loaded as single-agent
+                )
+                datasets.append(dataset)
+
+            print(f"Loaded {num_agents} agent datasets from {base_dir}")
+            return datasets
+
+        # Single-agent loading (original logic)
         base_dir = Path(active_adaptation.__file__).parent.parent
         if isinstance(root_path, ListConfig) or isinstance(root_path, list):
             path_patterns = list(root_path)

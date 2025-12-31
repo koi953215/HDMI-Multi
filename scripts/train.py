@@ -123,7 +123,8 @@ def main(cfg: DictConfig):
         tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
         tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
 
-    N = env.num_envs
+    # Multi-agent: use batch_size_total (flattened batch) instead of num_envs (physical envs)
+    N = getattr(env, 'batch_size_total', env.num_envs)
     T = cfg.algo.train_every
     device = env.device
 

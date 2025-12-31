@@ -132,40 +132,46 @@ class _Env(EnvBase):
         self.scene: InteractiveScene
         self.setup_scene()
         self._ground_mesh = None
-        
+
         self.max_episode_length = self.cfg.max_episode_length
         self.step_dt = self.cfg.sim.step_dt
         self.physics_dt = self.sim.get_physics_dt()
         self.decimation = int(self.step_dt / self.physics_dt)
-        
+
+        # Multi-agent support: batch_size = num_envs * num_agents (flattened)
+        self.num_agents = self.cfg.get("num_agents", 1)
+        self.num_envs_per_agent = self.num_envs  # Physical environments in Isaac
+        self.batch_size_total = self.num_envs * self.num_agents
+
         print(f"Step dt: {self.step_dt}, physics dt: {self.physics_dt}, decimation: {self.decimation}")
+        print(f"Multi-agent: {self.num_agents} agents, {self.num_envs_per_agent} envs/agent, total batch: {self.batch_size_total}")
 
         super().__init__(
             device=self.sim.device,
-            batch_size=[self.num_envs],
+            batch_size=[self.batch_size_total],
             run_type_checks=False,
         )
-        self.episode_length_buf = torch.zeros(self.num_envs, dtype=int, device=self.device)
+        self.episode_length_buf = torch.zeros(self.batch_size_total, dtype=int, device=self.device)
         self.episode_count = 0
         self.current_iter = 0
 
         # parse obs and reward functions
         self.done_spec = Composite(
-            done=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
-            terminated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
-            truncated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
-            shape=[self.num_envs],
+            done=Binary(1, [self.batch_size_total, 1], dtype=bool, device=self.device),
+            terminated=Binary(1, [self.batch_size_total, 1], dtype=bool, device=self.device),
+            truncated=Binary(1, [self.batch_size_total, 1], dtype=bool, device=self.device),
+            shape=[self.batch_size_total],
             device=self.device
         )
 
         self.reward_spec = Composite(
             {
                 "stats": {
-                    "episode_len": UnboundedContinuous([self.num_envs, 1]),
-                    "success": UnboundedContinuous([self.num_envs, 1]),
+                    "episode_len": UnboundedContinuous([self.batch_size_total, 1]),
+                    "success": UnboundedContinuous([self.batch_size_total, 1]),
                 },
             },
-            shape=[self.num_envs]
+            shape=[self.batch_size_total]
         ).to(self.device)
 
         members = dict(inspect.getmembers(self.__class__, inspect.isclass))
@@ -202,9 +208,9 @@ class _Env(EnvBase):
         
         self.action_spec = Composite(
             {
-                "action": UnboundedContinuous((self.num_envs, self.action_dim))
+                "action": UnboundedContinuous((self.batch_size_total, self.action_dim))
             },
-            shape=[self.num_envs]
+            shape=[self.batch_size_total]
         ).to(self.device)
         
         addons = self.cfg.get("addons", {})
@@ -244,8 +250,8 @@ class _Env(EnvBase):
             self.observation_funcs[group_key] = ObsGroup(group_key, funcs)
         
         for callback in self._startup_callbacks:
-            callback()        
-       
+            callback()
+
         reward_spec = Composite({})
 
         # parse rewards
@@ -288,8 +294,8 @@ class _Env(EnvBase):
 
         reward_spec["reward"] = UnboundedContinuous(max(1, len(self.reward_groups)), device=self.device)
         reward_spec["discount"] = UnboundedContinuous(1, device=self.device)
-        self.reward_spec.update(reward_spec.expand(self.num_envs).to(self.device))
-        self.discount = torch.ones((self.num_envs, 1), device=self.device)
+        self.reward_spec.update(reward_spec.expand(self.batch_size_total).to(self.device))
+        self.discount = torch.ones((self.batch_size_total, 1), device=self.device)
 
         observation_spec = {}
         for group_key, group in self.observation_funcs.items():
@@ -300,8 +306,8 @@ class _Env(EnvBase):
                 raise e
 
         self.observation_spec = Composite(
-            observation_spec, 
-            shape=[self.num_envs],
+            observation_spec,
+            shape=[self.batch_size_total],
             device=self.device
         )
 
@@ -312,7 +318,7 @@ class _Env(EnvBase):
             self.termination_funcs[key] = term_func
             self._update_callbacks.append(term_func.update)
             self._reset_callbacks.append(term_func.reset)
-            self.reward_spec["stats", "termination", key] = UnboundedContinuous((self.num_envs, 1), device=self.device)
+            self.reward_spec["stats", "termination", key] = UnboundedContinuous((self.batch_size_total, 1), device=self.device)
 
         self.timestamp = 0
 
@@ -340,6 +346,24 @@ class _Env(EnvBase):
     def num_envs(self) -> int:
         """The number of instances of the environment that are running."""
         return self.scene.num_envs
+
+    def get_flat_index(self, env_id: torch.Tensor, agent_id: int) -> torch.Tensor:
+        """
+        Convert (env_id, agent_id) to flat index.
+        Interleaved ordering: [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
+        flat_idx = env_id * num_agents + agent_id
+        """
+        return env_id * self.num_agents + agent_id
+
+    def get_env_agent_ids(self, flat_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert flat index to (env_id, agent_id).
+        env_id = flat_idx // num_agents
+        agent_id = flat_idx % num_agents
+        """
+        env_id = flat_idx // self.num_agents
+        agent_id = flat_idx % self.num_agents
+        return env_id, agent_id
 
     @property
     def stats_ema(self):
@@ -371,18 +395,28 @@ class _Env(EnvBase):
     def _reset(self, tensordict: TensorDictBase | None = None, **kwargs) -> TensorDictBase:
         start = time.perf_counter()
         if tensordict is not None:
-            env_mask = tensordict.get("_reset").reshape(self.num_envs)
+            env_mask = tensordict.get("_reset").reshape(self.batch_size_total)
             env_ids = env_mask.nonzero().squeeze(-1)
             self.episode_count += env_ids.numel()
         else:
-            env_ids = torch.arange(self.num_envs, device=self.device)
+            env_ids = torch.arange(self.batch_size_total, device=self.device)
+
         if len(env_ids):
             self._reset_idx(env_ids)
-            self.scene.reset(env_ids)
+
+            # For multi-agent: only reset unique physical environments
+            if self.num_agents > 1:
+                unique_env_ids, _ = self.get_env_agent_ids(env_ids)
+                unique_env_ids = torch.unique(unique_env_ids)
+                self.scene.reset(unique_env_ids)
+            else:
+                self.scene.reset(env_ids)
+
         self.episode_length_buf[env_ids] = 0
+
         for callback in self._reset_callbacks:
             callback(env_ids)
-        tensordict = TensorDict({}, self.num_envs, device=self.device)
+        tensordict = TensorDict({}, self.batch_size_total, device=self.device)
         tensordict.update(self.observation_spec.zero())
         end = time.perf_counter()
         self.reset_time = self.reset_time * self._stats_ema_decay + (end - start)
@@ -406,8 +440,8 @@ class _Env(EnvBase):
     def _compute_reward(self) -> TensorDictBase:
         start = time.perf_counter()
         if not self.reward_groups:
-            return {"reward": torch.ones((self.num_envs, 1), device=self.device)}
-        
+            return {"reward": torch.ones((self.batch_size_total, 1), device=self.device)}
+
         rewards = []
         for group, reward_group in self.reward_groups.items():
             reward = reward_group.compute()
@@ -429,17 +463,32 @@ class _Env(EnvBase):
     def _compute_termination(self) -> TensorDictBase:
         start = time.perf_counter()
         if not self.termination_funcs:
-            return torch.zeros((self.num_envs, 1), dtype=bool, device=self.device)
-        
+            return torch.zeros((self.batch_size_total, 1), dtype=bool, device=self.device)
+
         flags = []
         for key, func in self.termination_funcs.items():
             flag = func()
             self.stats["termination", key][:] = flag.float()
             flags.append(flag)
         flags = torch.cat(flags, dim=-1)
+        terminated = flags.any(dim=-1, keepdim=True)  # [batch_size_total, 1]
+
+        # Multi-agent: Only agent_0 can trigger termination (special mode)
+        if self.num_agents > 1 and self.cfg.get("agent0_only_termination", False):
+            # Extract agent_0's termination status for each physical environment
+            # Interleaved ordering: [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
+            # Agent 0 indices: [0, 2, 4, ...] = [0::num_agents]
+            agent0_indices = torch.arange(0, self.batch_size_total, self.num_agents, device=self.device)
+            agent0_terminated = terminated[agent0_indices]  # [num_envs_per_agent, 1]
+
+            # Broadcast agent_0's status to all agents in the same environment
+            # Each agent_0 status repeats num_agents times: [ag0_env0, ag0_env0, ag0_env1, ag0_env1, ...]
+            terminated_broadcast = agent0_terminated.repeat_interleave(self.num_agents, dim=0)  # [batch_size_total, 1]
+            terminated = terminated_broadcast
+
         end = time.perf_counter()
         self.termination_time = self.termination_time * self._stats_ema_decay + (end - start)
-        return flags.any(dim=-1, keepdim=True)
+        return terminated
 
     def _update(self):
         start = time.perf_counter()
@@ -487,8 +536,8 @@ class _Env(EnvBase):
         self.simulation_time = self.simulation_time * self._stats_ema_decay + (end - start)
         self.discount.fill_(1.0)
         self._update()
-        
-        tensordict = TensorDict({}, self.num_envs, device=self.device)
+
+        tensordict = TensorDict({}, self.batch_size_total, device=self.device)
         tensordict.update(self._compute_reward())
 
         # Note that command update is a special case
@@ -514,7 +563,7 @@ class _Env(EnvBase):
                 self.debug_draw.clear()
             for callback in self._debug_draw_callbacks:
                 callback()
-        
+
         self.ema_cnt = self.ema_cnt * self._stats_ema_decay + 1.
         return tensordict
     
@@ -615,7 +664,7 @@ class RewardGroup:
         self.funcs = funcs
         self.multiplicative = multiplicative
         self.enabled_rewards = sum([func.enabled for func in funcs.values()])
-        self.rew_buf = torch.zeros(env.num_envs, self.enabled_rewards, device=env.device)
+        self.rew_buf = torch.zeros(env.batch_size_total, self.enabled_rewards, device=env.device)
     
     def compute(self) -> torch.Tensor:
         rewards = []

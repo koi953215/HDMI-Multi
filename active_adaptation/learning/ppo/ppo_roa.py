@@ -85,6 +85,9 @@ class PPOConfig:
     checkpoint_path: Union[str, None] = None
     in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY)
 
+    # Multi-agent iPPO support
+    num_agents: int = 1  # Number of independent agents (default 1 for backward compatibility)
+
 cs = ConfigStore.instance()
 cs.store("ppo_roa_train", node=PPOConfig(phase="train", vecnorm="train", entropy_coef_start=0.001, entropy_coef_end=0.001), group="algo")
 cs.store("ppo_roa_adapt", node=PPOConfig(phase="adapt", vecnorm="eval", entropy_coef_start=0.00, entropy_coef_end=0.00), group="algo")
@@ -142,7 +145,7 @@ class GRUModule(nn.Module):
 class PPOROA(TensorDictModuleBase):
     train_in_keys = [CMD_KEY, OBS_KEY, OBS_PRIV_KEY, ACTION_KEY,
                      "adv", "ret", "is_init", "sample_log_prob", "step_count"]
-    
+
     def __init__(
         self,
         cfg: PPOConfig,
@@ -174,19 +177,31 @@ class PPOROA(TensorDictModuleBase):
             value_norm_cls = ValueNorm1
         else:
             value_norm_cls = ValueNormFake
-        self.value_norm = value_norm_cls(input_shape=num_reward_groups).to(self.device)
+
+        # Multi-agent support
+        self.num_agents = cfg.num_agents
+        if self.num_agents == 1:
+            # Single agent: use single ValueNorm
+            self.value_norm = value_norm_cls(input_shape=num_reward_groups).to(self.device)
+        else:
+            # Multi-agent: per-agent ValueNorm
+            self.value_norms = nn.ModuleList([
+                value_norm_cls(input_shape=num_reward_groups).to(self.device)
+                for _ in range(self.num_agents)
+            ])
+
         object.__setattr__(self, "env", env)
 
         self.action_dim = action_spec.shape[-1]
         self.joint_names = env.action_manager.joint_names
-        
+
         fake_input = observation_spec.zero()
-        
+
         if observation_spec.get("command_", None) is not None:
             global CMD_KEY
             CMD_KEY = "command_"
-        
-        # build encoder, adapt module, critic
+
+        # Prepare input keys for network builders
         encoder_priv_in_keys = [OBS_PRIV_KEY]
         adapt_module_in_keys = [OBS_KEY]
         critic_in_keys = [OBS_PRIV_KEY, OBS_KEY, CMD_KEY]
@@ -196,30 +211,30 @@ class PPOROA(TensorDictModuleBase):
             encoder_priv_in_keys.append(OBJECT_KEY)
             adapt_module_in_keys.append(OBJECT_KEY)
             critic_in_keys.append(OBJECT_KEY)
-    
-        latent_dim = self.cfg.latent_dim
-        self.encoder_priv = Seq(
-            CatTensors(encoder_priv_in_keys, "_encoder_priv_inp", del_keys=False, sort=False),
-            Mod(nn.Sequential(make_mlp([latent_dim]), nn.LazyLinear(latent_dim)), "_encoder_priv_inp", PRIV_FEATURE_KEY),
-            selected_out_keys=[PRIV_FEATURE_KEY]
-        ).to(self.device)
 
-        if self.cfg.adapt_module == "gru":
-            self.adapt_module =  Seq(
-                CatTensors(adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
-                Mod(GRUModule(latent_dim), ["_adapt_inp", "is_init", "adapt_hx"], [PRIV_PRED_KEY, ("next", "adapt_hx")]),
-                selected_out_keys=[PRIV_PRED_KEY, ("next", "adapt_hx")]
-            ).to(self.device)
-        elif self.cfg.adapt_module == "mlp":
-            self.adapt_module = Seq(
-                CatTensors(adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
-                Mod(nn.Sequential(make_mlp([latent_dim, latent_dim]), nn.LazyLinear(latent_dim)), "_adapt_inp", [PRIV_PRED_KEY]),
-                selected_out_keys=[PRIV_PRED_KEY],
-            ).to(self.device)
+        # Store keys and dimensions for network builders
+        self.encoder_priv_in_keys = encoder_priv_in_keys
+        self.adapt_module_in_keys = adapt_module_in_keys
+        self.critic_in_keys = critic_in_keys
+        self.num_reward_groups = num_reward_groups
+        latent_dim = self.cfg.latent_dim
+        self.latent_dim = latent_dim
+
+        # Build networks conditionally based on num_agents
+        if self.num_agents == 1:
+            # Single agent: use existing network structure
+            self.encoder_priv = self._build_encoder_priv()
+            self.adapt_module = self._build_adapt_module()
         else:
-            raise ValueError(f"Invalid adapt module: {self.cfg.adapt_module}")
+            # Multi-agent: create N independent networks using ModuleList
+            self.encoders_priv = nn.ModuleList([
+                self._build_encoder_priv() for _ in range(self.num_agents)
+            ])
+            self.adapt_modules = nn.ModuleList([
+                self._build_adapt_module() for _ in range(self.num_agents)
+            ])
         
-        # build actor
+        # Prepare residual module for teacher policy
         if cfg.phase == "train" and cfg.enable_residual_distillation:
             assert REF_JPOS_KEY in observation_spec, f"{REF_JPOS_KEY} should be in observation_spec"
             class RefJointPos(nn.Module):
@@ -235,41 +250,41 @@ class PPOROA(TensorDictModuleBase):
         out_keys = ["loc"]
         residual_module = Mod(residual_module_cls(), in_keys, out_keys)
 
-        def build_actor(in_keys: List[str], dist_cls, dist_keys, residual_module=None) -> ProbabilisticActor:
-            actor_modules = [
-                    CatTensors(in_keys, "_actor_inp", del_keys=False, sort=False),
-                    Mod(make_mlp([512, 256, 256]), ["_actor_inp"], ["_actor_feature"]),
-                    Mod(Actor(self.action_dim, init_noise_scale=self.cfg.init_noise_scale, load_noise_scale=self.cfg.load_noise_scale), ["_actor_feature"], dist_keys)
-            ]
-            if residual_module is not None:
-                actor_modules.append(residual_module)
-            actor_module = Seq(*actor_modules)
-            actor = ProbabilisticActor(
-                module=actor_module,
-                in_keys=dist_keys,
-                out_keys=[ACTION_KEY],
-                distribution_class=dist_cls,
-                return_log_prob=True
-            ).to(self.device)
-            return actor
-
         self.dist_cls = IndependentNormal
         self.dist_keys = IndependentNormal.dist_keys
 
-        in_keys = [CMD_KEY, OBS_KEY, PRIV_FEATURE_KEY]
-        self.actor = build_actor(in_keys, self.dist_cls, self.dist_keys, residual_module=residual_module)
-        if cfg.phase == "adapt_est":
-            in_keys = [CMD_KEY, OBS_KEY, "priv_est"]
-        else:
-            in_keys = [CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
-        self.actor_adapt = build_actor(in_keys, self.dist_cls, self.dist_keys)
+        # Build actor and critic networks conditionally
+        if self.num_agents == 1:
+            # Single agent: use existing network structure
+            in_keys = [CMD_KEY, OBS_KEY, PRIV_FEATURE_KEY]
+            self.actor = self._build_actor(in_keys, self.dist_cls, self.dist_keys, residual_module=residual_module)
 
-        # build critic
-        _critic = nn.Sequential(make_mlp([512, 256, 128]), nn.LazyLinear(num_reward_groups))
-        self.critic = Seq(
-            CatTensors(critic_in_keys, "_critic_input", del_keys=False),
-            Mod(_critic, ["_critic_input"], ["state_value"])
-        ).to(self.device)
+            if cfg.phase == "adapt_est":
+                in_keys = [CMD_KEY, OBS_KEY, "priv_est"]
+            else:
+                in_keys = [CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
+            self.actor_adapt = self._build_actor(in_keys, self.dist_cls, self.dist_keys)
+
+            self.critic = self._build_critic()
+        else:
+            # Multi-agent: create N independent networks using ModuleList
+            self.actors = nn.ModuleList([
+                self._build_actor([CMD_KEY, OBS_KEY, PRIV_FEATURE_KEY], self.dist_cls, self.dist_keys, residual_module=residual_module)
+                for _ in range(self.num_agents)
+            ])
+
+            if cfg.phase == "adapt_est":
+                in_keys_adapt = [CMD_KEY, OBS_KEY, "priv_est"]
+            else:
+                in_keys_adapt = [CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
+            self.actors_adapt = nn.ModuleList([
+                self._build_actor(in_keys_adapt, self.dist_cls, self.dist_keys)
+                for _ in range(self.num_agents)
+            ])
+
+            self.critics = nn.ModuleList([
+                self._build_critic() for _ in range(self.num_agents)
+            ])
 
         # build estimator
         if self.cfg.phase in ["train_est", "adapt_est"]:
@@ -323,13 +338,23 @@ class PPOROA(TensorDictModuleBase):
             fake_input["is_init"] = torch.ones(fake_input.shape[0], 1, dtype=torch.bool)
             fake_input["adapt_hx"] = torch.zeros(fake_input.shape[0], latent_dim)
 
-        self.encoder_priv(fake_input)
-        self.actor(fake_input)
-        self.critic(fake_input)
-        self.adapt_module(fake_input)
+        # Initialize networks with fake input
+        if self.num_agents == 1:
+            self.encoder_priv(fake_input)
+            self.actor(fake_input)
+            self.critic(fake_input)
+            self.adapt_module(fake_input)
+            self.actor_adapt(fake_input)
+        else:
+            for i in range(self.num_agents):
+                self.encoders_priv[i](fake_input)
+                self.actors[i](fake_input)
+                self.critics[i](fake_input)
+                self.adapt_modules[i](fake_input)
+                self.actors_adapt[i](fake_input)
+
         if self.cfg.phase in ["train_est", "adapt_est"]:
             self.estimator(fake_input)
-        self.actor_adapt(fake_input)
         if self.cfg.train_dr_estimator:
             self.dr_estimator(fake_input)
 
@@ -340,45 +365,64 @@ class PPOROA(TensorDictModuleBase):
             if isinstance(module, nn.Conv2d):
                 nn.init.orthogonal_(module.weight, 0.01)
                 nn.init.constant_(module.bias, 0.)
-        
-        self.apply(init_)
-        self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
 
+        self.apply(init_)
+
+        # Create adapt_ema
+        if self.num_agents == 1:
+            self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
+        else:
+            self.adapt_emas = nn.ModuleList([
+                copy.deepcopy(self.adapt_modules[i]).requires_grad_(False)
+                for i in range(self.num_agents)
+            ])
+
+        # Create optimizers
         self.lr_policy = cfg.lr
-        if self.cfg.phase == "train":
-            policy_params = [
+        if self.num_agents == 1:
+            # Single agent: existing optimizer structure
+            if self.cfg.phase == "train":
+                policy_params = [
                     {"params": self.actor.parameters()},
                     {"params": self.encoder_priv.parameters()},
                 ]
-        else:
-            policy_params = [
+            else:
+                policy_params = [
                     {"params": self.actor_adapt.parameters()},
                 ]
-            
-        self.opt_policy = torch.optim.Adam(
-            policy_params,
-            lr=self.lr_policy,
-        )
-        self.opt_critic = torch.optim.Adam(
-            [
-                {"params": self.critic.parameters()},
-            ],
-            lr=cfg.lr,
-        )
 
-        self.opt_adapt = torch.optim.Adam(
-            [
-                {"params": self.adapt_module.parameters()},
-            ],
-            lr=cfg.lr,
-        )
-        if cfg.phase == "train" and cfg.enable_residual_distillation:
-            self.opt_adapt_actor = torch.optim.Adam(
-                [
-                    {"params": self.actor_adapt.parameters()},
-                ],
-                lr=cfg.lr,
-            )
+            self.opt_policy = torch.optim.Adam(policy_params, lr=self.lr_policy)
+            self.opt_critic = torch.optim.Adam([{"params": self.critic.parameters()}], lr=cfg.lr)
+            self.opt_adapt = torch.optim.Adam([{"params": self.adapt_module.parameters()}], lr=cfg.lr)
+
+            if cfg.phase == "train" and cfg.enable_residual_distillation:
+                self.opt_adapt_actor = torch.optim.Adam([{"params": self.actor_adapt.parameters()}], lr=cfg.lr)
+        else:
+            # Multi-agent: separate optimizers for each agent
+            self.opt_policies = []
+            self.opt_critics = []
+            self.opt_adapts = []
+
+            for i in range(self.num_agents):
+                if self.cfg.phase == "train":
+                    policy_params = [
+                        {"params": self.actors[i].parameters()},
+                        {"params": self.encoders_priv[i].parameters()},
+                    ]
+                else:
+                    policy_params = [
+                        {"params": self.actors_adapt[i].parameters()},
+                    ]
+
+                self.opt_policies.append(torch.optim.Adam(policy_params, lr=self.lr_policy, eps=1e-5))
+                self.opt_critics.append(torch.optim.Adam([{"params": self.critics[i].parameters()}], lr=cfg.lr, eps=1e-5))
+                self.opt_adapts.append(torch.optim.Adam([{"params": self.adapt_modules[i].parameters()}], lr=cfg.lr, eps=1e-5))
+
+            if cfg.phase == "train" and cfg.enable_residual_distillation:
+                self.opt_adapt_actors = [
+                    torch.optim.Adam([{"params": self.actors_adapt[i].parameters()}], lr=cfg.lr, eps=1e-5)
+                    for i in range(self.num_agents)
+                ]
         if cfg.phase in ["train_est", "adapt_est"]:
             self.opt_estimator = torch.optim.Adam(
                 [
@@ -404,42 +448,60 @@ class PPOROA(TensorDictModuleBase):
             return TensorDictPrimer({}, reset_key="done")
 
     def get_rollout_policy(self, mode: str="train"):
-        modules = []
-        
-        if self.cfg.phase == "train":
-            modules.append(self.encoder_priv)
-            modules.append(self.actor)
-            modules.append(self.adapt_module)
-        elif self.cfg.phase == "adapt":
-            modules.append(self.adapt_module)
-            modules.append(self.actor_adapt)
-        elif self.cfg.phase == "finetune":
-            modules.append(self.adapt_ema)
-            modules.append(self.actor_adapt)
-        elif self.cfg.phase == "train_est":
-            modules.append(self.adapt_ema)
-            modules.append(self.actor_adapt)
-        elif self.cfg.phase == "adapt_est":
-            modules.append(self.estimator)
-            modules.append(self.actor_adapt)
+        if self.num_agents == 1:
+            # Single agent: return existing policy
+            modules = []
 
-        out_keys = ["sample_log_prob", "action"] + self.dist_keys
-        if self.cfg.adapt_module == "gru":
-            out_keys.append(("next", "adapt_hx"))
-        if self.cfg.phase == "finetune":
-            out_keys.append(PRIV_PRED_KEY)
-        if self.cfg.phase == "adapt_est":
-            out_keys.append("priv_est")
+            if self.cfg.phase == "train":
+                modules.append(self.encoder_priv)
+                modules.append(self.actor)
+                modules.append(self.adapt_module)
+            elif self.cfg.phase == "adapt":
+                modules.append(self.adapt_module)
+                modules.append(self.actor_adapt)
+            elif self.cfg.phase == "finetune":
+                modules.append(self.adapt_ema)
+                modules.append(self.actor_adapt)
+            elif self.cfg.phase == "train_est":
+                modules.append(self.adapt_ema)
+                modules.append(self.actor_adapt)
+            elif self.cfg.phase == "adapt_est":
+                modules.append(self.estimator)
+                modules.append(self.actor_adapt)
 
-        if self.cfg.train_dr_estimator:
-            modules.append(self.dr_estimator)
-            out_keys.append("dr_pred")
+            out_keys = ["sample_log_prob", "action"] + self.dist_keys
+            if self.cfg.adapt_module == "gru":
+                out_keys.append(("next", "adapt_hx"))
+            if self.cfg.phase == "finetune":
+                out_keys.append(PRIV_PRED_KEY)
+            if self.cfg.phase == "adapt_est":
+                out_keys.append("priv_est")
 
-        policy = Seq(*modules, selected_out_keys=out_keys)
-        return policy
+            if self.cfg.train_dr_estimator:
+                modules.append(self.dr_estimator)
+                out_keys.append("dr_pred")
+
+            policy = Seq(*modules, selected_out_keys=out_keys)
+            return policy
+        else:
+            # Multi-agent: return wrapper policy
+            return self._create_multi_agent_rollout_policy()
     
     def train_op(self, tensordict: TensorDict):
         tensordict = tensordict.exclude("stats")
+
+        if self.num_agents == 1:
+            # Single agent: use existing training logic
+            info = self._train_single_agent(tensordict)
+        else:
+            # Multi-agent: train each agent independently
+            info = self._train_multi_agents(tensordict)
+
+        self.num_updates += 1
+        return info
+
+    def _train_single_agent(self, tensordict):
+        """Train single agent (backward compatible)"""
         info = {}
         if self.cfg.phase == "train":
             info.update(self.train_policy(tensordict.copy()))
@@ -454,14 +516,62 @@ class PPOROA(TensorDictModuleBase):
         elif self.cfg.phase == "adapt_est":
             info.update(self.train_policy(tensordict.copy()))
             info.update(self.train_estimator(tensordict.copy()))
-            
-        self.num_updates += 1
 
         actor = self.actor if self.cfg.phase == "train" else self.actor_adapt
         action_std = actor.module[0][2].module.actor_std.detach()
         for joint_name, std in zip(self.joint_names, action_std):
             info[f"actor_std/{joint_name}"] = std
         info["actor_std/mean"] = action_std.mean()
+        return info
+
+    def _train_multi_agents(self, tensordict):
+        """Train multiple agents independently (iPPO)"""
+        batch_size_total = tensordict.batch_size[0]
+
+        # Compute advantages for all agents (uses interleaved data)
+        with torch.no_grad():
+            for agent_id in range(self.num_agents):
+                agent_indices = torch.arange(agent_id, batch_size_total, self.num_agents, device=tensordict.device)
+                agent_td = tensordict[agent_indices]
+                self._compute_advantage(agent_td, self.critics[agent_id], "adv", "ret", update_value_norm=True, agent_id=agent_id)
+                # Write back to tensordict
+                tensordict["adv"][agent_indices] = agent_td["adv"]
+                tensordict["ret"][agent_indices] = agent_td["ret"]
+
+        info = {}
+
+        # Train each agent independently
+        for agent_id in range(self.num_agents):
+            # Extract agent's data
+            agent_indices = torch.arange(agent_id, batch_size_total, self.num_agents, device=tensordict.device)
+            agent_td = tensordict[agent_indices].clone()
+
+            # Train agent's networks based on phase
+            if self.cfg.phase == "train":
+                infos_policy = self.train_policy_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_policy.items()})
+
+                infos_adapt = self.train_adapt_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_adapt.items()})
+            elif self.cfg.phase == "adapt":
+                infos_adapt = self.train_adapt_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_adapt.items()})
+            elif self.cfg.phase == "finetune":
+                infos_policy = self.train_policy_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_policy.items()})
+
+                infos_adapt = self.train_adapt_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_adapt.items()})
+            elif self.cfg.phase == "train_est":
+                infos_est = self.train_estimator(agent_td.copy())  # Estimator is shared
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_est.items()})
+            elif self.cfg.phase == "adapt_est":
+                infos_policy = self.train_policy_single_agent(agent_td, agent_id)
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_policy.items()})
+
+                infos_est = self.train_estimator(agent_td.copy())
+                info.update({f"agent{agent_id}/{k}": v for k, v in infos_est.items()})
+
         return info
     
     def train_policy(self, tensordict: TensorDict):    
@@ -589,14 +699,132 @@ class PPOROA(TensorDictModuleBase):
         infos = {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
         return infos
 
+    # ============ Per-Agent Training Methods (Multi-Agent iPPO) ============
+    def train_policy_single_agent(self, tensordict, agent_id):
+        """Train single agent's policy network (teacher)"""
+        infos = []
+
+        # Use agent-specific networks and optimizers
+        encoder_priv = self.encoders_priv[agent_id]
+        actor = self.actors[agent_id]
+        critic = self.critics[agent_id]
+        opt_policy = self.opt_policies[agent_id]
+        opt_critic = self.opt_critics[agent_id]
+
+        # Entropy coef schedule (shared across agents)
+        current_iter = self.env.current_iter
+        entropy_progress = float(np.clip(current_iter / self.cfg.entropy_decay_iters, 0., 1.))
+        self.entropy_coef = self.cfg.entropy_coef_start + (self.cfg.entropy_coef_end - self.cfg.entropy_coef_start) * entropy_progress
+
+        for epoch in range(self.cfg.ppo_epochs):
+            batch = make_batch(tensordict, self.cfg.num_minibatches)
+            for minibatch in batch:
+                info = {}
+                info.update(self._update_ppo_single_agent(minibatch, encoder_priv, actor, critic, opt_policy, opt_critic))
+                infos.append(info)
+
+                if self.desired_kl is not None:  # adaptive learning rate
+                    kl = infos[-1]["actor/kl"]
+                    if kl > self.desired_kl * 2.0:
+                        self.lr_policy = max(1e-5, self.lr_policy / 1.5)
+                    elif kl < self.desired_kl / 2.0 and kl > 0.0:
+                        self.lr_policy = min(1e-2, self.lr_policy * 1.5)
+
+                for param_group in opt_policy.param_groups:
+                    param_group["lr"] = self.lr_policy
+
+        infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
+        infos["actor/lr"] = self.lr_policy
+        infos["actor/entropy_coef"] = self.entropy_coef
+
+        ret = tensordict["ret"]
+        ret_mean = ret.mean(dim=(0, 1))
+        ret_std = ret.std(dim=(0, 1))
+        for i, group_name in enumerate(self.reward_groups):
+            infos[f"critic/{group_name}.ret_mean"] = ret_mean[i].item()
+            infos[f"critic/{group_name}.ret_std"] = ret_std[i].item()
+            infos[f"critic/{group_name}.neg_rew_ratio"] = (tensordict[REWARD_KEY][:, :, i] <= 0.).float().mean().item()
+        return dict(sorted(infos.items()))
+
+    @set_recurrent_mode(True)
+    def train_adapt_single_agent(self, tensordict, agent_id):
+        """Train single agent's adaptation module (student)"""
+        infos = []
+
+        # Use agent-specific networks and optimizers
+        encoder_priv = self.encoders_priv[agent_id]
+        adapt_module = self.adapt_modules[agent_id]
+        adapt_ema = self.adapt_emas[agent_id]
+        actor = self.actors[agent_id]
+        actor_adapt = self.actors_adapt[agent_id]
+        opt_adapt = self.opt_adapts[agent_id]
+
+        with torch.no_grad():
+            encoder_priv(tensordict)
+
+        for epoch in range(2):
+            for minibatch in make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every):
+                adapt_module(minibatch)
+                priv_loss = self.adapt_loss_fn(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY])
+                priv_loss = (priv_loss * (~minibatch["is_init"])).mean()
+                opt_adapt.zero_grad()
+                priv_loss.backward()
+                opt_adapt_grad_norm = nn.utils.clip_grad_norm_(adapt_module.parameters(), self.cfg.max_grad_norm)
+                opt_adapt.step()
+
+                info = {}
+                info["adapt/priv_loss"] = priv_loss
+                info["adapt/grad_norm"] = opt_adapt_grad_norm
+                info["adapt/priv_feature_norm"] = minibatch[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean()
+                info["adapt/priv_pred_norm"] = minibatch[PRIV_PRED_KEY].norm(p=2, dim=-1).mean()
+
+                if self.cfg.phase == "train" and self.cfg.enable_residual_distillation:
+                    # Residual action distillation
+                    opt_adapt_actor = self.opt_adapt_actors[agent_id]
+                    with torch.no_grad():
+                        dist_teacher = actor.get_dist(minibatch)
+
+                    if self.cfg.distill_with_priv_pred:
+                        minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
+                    else:
+                        minibatch[PRIV_PRED_KEY] = minibatch[PRIV_FEATURE_KEY].detach()
+                    dist_student = actor_adapt.get_dist(minibatch)
+
+                    adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
+
+                    opt_adapt_actor.zero_grad()
+                    adapt_loss.backward()
+                    opt_adapt_actor.step()
+                    info["adapt/adapt_loss"] = adapt_loss
+
+                if self.cfg.train_dr_estimator:
+                    minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
+                    self.dr_estimator(minibatch)
+
+                    dr_est_loss = (minibatch["dr_pred"] - minibatch["dr_"]).square().mean()
+                    self.opt_dr_estimator.zero_grad()
+                    dr_est_grad_norm = nn.utils.clip_grad_norm_(self.dr_estimator.parameters(), self.cfg.max_grad_norm)
+                    dr_est_loss.backward()
+                    self.opt_dr_estimator.step()
+                    info["adapt/dr_est_grad_norm"] = dr_est_grad_norm
+                    info["adapt/dr_est_loss"] = dr_est_loss
+
+                infos.append(TensorDict(info, []))
+
+        soft_copy_(adapt_module, adapt_ema, 0.04)
+
+        infos = {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
+        return infos
+
     @torch.no_grad()
     def _compute_advantage(
-        self, 
+        self,
         tensordict: TensorDict,
-        critic: Mod, 
+        critic: Mod,
         adv_key: str="adv",
         ret_key: str="ret",
         update_value_norm: bool=True,
+        agent_id: int=None,
     ):
         # with tensordict.view(-1) as tensordict_flat:
         #     critic(tensordict_flat)
@@ -616,8 +844,15 @@ class PPOROA(TensorDictModuleBase):
         discount = tensordict["next", "discount"]
         terms = tensordict[TERM_KEY]
         dones = tensordict[DONE_KEY]
-        values = self.value_norm.denormalize(values)
-        next_values = self.value_norm.denormalize(next_values)
+
+        # Multi-agent support: use agent-specific value normalization
+        if agent_id is not None:
+            value_norm = self.value_norms[agent_id]
+        else:
+            value_norm = self.value_norm
+
+        values = value_norm.denormalize(values)
+        next_values = value_norm.denormalize(next_values)
 
         adv, ret = self.gae(rewards, terms, dones, values, next_values, discount)
 
@@ -639,8 +874,8 @@ class PPOROA(TensorDictModuleBase):
             adv_final = adv_sum_norm
 
         if update_value_norm:
-            self.value_norm.update(ret)
-        ret = self.value_norm.normalize(ret)
+            value_norm.update(ret)
+        ret = value_norm.normalize(ret)
 
         tensordict.set(adv_key, adv_final)
         # shape: (N, T, 1)
@@ -733,44 +968,395 @@ class PPOROA(TensorDictModuleBase):
             info[f"critic/{group_name}.value_loss"] = value_loss[i].detach()
         return info
 
-    def state_dict(self):
+    def _update_ppo_single_agent(self, tensordict, encoder_priv, actor, critic, opt_policy, opt_critic):
+        """Single PPO update step for one agent (multi-agent version)"""
+        dist_kwargs_old = tensordict.select(*self.dist_keys)
+
         if self.cfg.phase == "train":
-            if not self.cfg.enable_residual_distillation:
-                hard_copy_(self.actor, self.actor_adapt)
-            else:
-                actor_std = self.actor.module[0][2].module.actor_std
-                actor_adapt_std = self.actor_adapt.module[0][2].module.actor_std
-                actor_adapt_std.data.copy_(actor_std.data)
-            
-        if self.cfg.phase in ["train", "adapt"]:
-            hard_copy_(self.adapt_module, self.adapt_ema)
-        
-        state_dict = OrderedDict()
-        for name, module in self.named_children():
-            state_dict[name] = module.state_dict()
-        state_dict["last_phase"] = self.cfg.phase
-        state_dict["last_iter"] = self.env.current_iter
-        state_dict["lr_policy"] = self.lr_policy
-        return state_dict
+            encoder_priv(tensordict)
+        elif self.cfg.phase == "finetune":
+            pass  # actor_adapt is already passed as 'actor'
+        elif self.cfg.phase == "adapt_est":
+            pass  # actor_adapt is already passed as 'actor'
+        else:
+            raise ValueError(f"Invalid phase: {self.cfg.phase}")
+
+        dist = actor.get_dist(tensordict)
+        log_probs = dist.log_prob(tensordict[ACTION_KEY])
+        entropy = dist.entropy().mean()
+
+        if self.cfg.phase == "train":
+            valid = (tensordict["step_count"] > 1)
+        else:
+            valid = (tensordict["step_count"] > 5)
+        valid = valid.squeeze(-1)
+
+        adv = tensordict["adv"]
+        log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
+        ratio = torch.exp(log_ratio)
+        surr1 = adv * ratio
+        surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
+        if self.cfg.normalize_ratio:
+            clamped_ratio = ratio.clamp(1.-self.clip_param, 1.+self.clip_param).detach()
+            surr1 = surr1 / clamped_ratio
+            surr2 = surr2 / clamped_ratio
+        policy_loss = - (torch.min(surr1, surr2)[valid]).mean()
+        entropy_loss = - self.entropy_coef * entropy
+
+        b_returns = tensordict["ret"]
+        values = critic(tensordict)["state_value"]
+        value_loss = self.critic_loss_fn(b_returns, values)
+        value_loss = value_loss[valid].mean(dim=0)
+
+        loss = policy_loss + entropy_loss + value_loss.mean()
+
+        opt_policy.zero_grad()
+        opt_critic.zero_grad()
+        loss.backward()
+        actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+        critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), self.cfg.max_grad_norm)
+        if self.cfg.phase == "train":
+            priv_grad_norm = nn.utils.clip_grad_norm_(encoder_priv.parameters(), self.cfg.max_grad_norm)
+        else:
+            priv_grad_norm = torch.zeros(1)
+        opt_policy.step()
+        opt_critic.step()
+
+        with torch.no_grad():
+            explained_var = 1 - value_loss / b_returns[valid].var(dim=0)
+            clipfrac = ((ratio - 1.0).abs() > self.clip_param).float().mean()
+            dist_old = self.dist_cls(**dist_kwargs_old)
+            kl = D.kl_divergence(dist_old, dist).mean()
+
+        info = {
+            "actor/policy_loss": policy_loss.detach(),
+            "actor/entropy": entropy.detach(),
+            "actor/mean_std": tensordict["scale"].detach().mean(),
+            "actor/grad_norm": actor_grad_norm,
+            "actor/clamp_ratio": clipfrac,
+            "actor/kl": kl,
+            "actor/priv_grad_norm": priv_grad_norm,
+            'actor/approx_kl': ((ratio - 1) - log_ratio).mean(),
+            "critic/grad_norm": critic_grad_norm,
+        }
+        for i, group_name in enumerate(self.reward_groups):
+            info[f"critic/{group_name}.explained_var"] = explained_var[i]
+            info[f"critic/{group_name}.value_loss"] = value_loss[i].detach()
+        return info
+
+    # ============ Network Builder Methods ============
+    def _build_encoder_priv(self):
+        """Build privileged encoder network"""
+        return Seq(
+            CatTensors(self.encoder_priv_in_keys, "_encoder_priv_inp", del_keys=False, sort=False),
+            Mod(nn.Sequential(make_mlp([self.latent_dim]), nn.LazyLinear(self.latent_dim)),
+                "_encoder_priv_inp", PRIV_FEATURE_KEY),
+            selected_out_keys=[PRIV_FEATURE_KEY]
+        ).to(self.device)
+
+    def _build_adapt_module(self):
+        """Build adaptation module (GRU or MLP)"""
+        if self.cfg.adapt_module == "gru":
+            return Seq(
+                CatTensors(self.adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
+                Mod(GRUModule(self.latent_dim), ["_adapt_inp", "is_init", "adapt_hx"],
+                    [PRIV_PRED_KEY, ("next", "adapt_hx")]),
+                selected_out_keys=[PRIV_PRED_KEY, ("next", "adapt_hx")]
+            ).to(self.device)
+        elif self.cfg.adapt_module == "mlp":
+            return Seq(
+                CatTensors(self.adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
+                Mod(nn.Sequential(make_mlp([self.latent_dim, self.latent_dim]), nn.LazyLinear(self.latent_dim)),
+                    "_adapt_inp", [PRIV_PRED_KEY]),
+                selected_out_keys=[PRIV_PRED_KEY],
+            ).to(self.device)
+        else:
+            raise ValueError(f"Invalid adapt module: {self.cfg.adapt_module}")
+
+    def _build_actor(self, in_keys, dist_cls, dist_keys, residual_module=None):
+        """Build policy network"""
+        actor_modules = [
+            CatTensors(in_keys, "_actor_inp", del_keys=False, sort=False),
+            Mod(make_mlp([512, 256, 256]), ["_actor_inp"], ["_actor_feature"]),
+            Mod(Actor(self.action_dim, init_noise_scale=self.cfg.init_noise_scale,
+                     load_noise_scale=self.cfg.load_noise_scale), ["_actor_feature"], dist_keys)
+        ]
+        if residual_module is not None:
+            actor_modules.append(residual_module)
+        actor_module = Seq(*actor_modules)
+        actor = ProbabilisticActor(
+            module=actor_module,
+            in_keys=dist_keys,
+            out_keys=[ACTION_KEY],
+            distribution_class=dist_cls,
+            return_log_prob=True
+        ).to(self.device)
+        return actor
+
+    def _build_critic(self):
+        """Build value function network"""
+        _critic = nn.Sequential(make_mlp([512, 256, 128]), nn.LazyLinear(self.num_reward_groups))
+        return Seq(
+            CatTensors(self.critic_in_keys, "_critic_input", del_keys=False),
+            Mod(_critic, ["_critic_input"], ["state_value"])
+        ).to(self.device)
+
+    def _create_multi_agent_rollout_policy(self):
+        """Create multi-agent rollout policy wrapper"""
+        class MultiAgentPolicyWrapper(TensorDictModuleBase):
+            def __init__(wrapper_self, ppo_roa):
+                super().__init__()
+                wrapper_self.ppo_roa = ppo_roa
+                wrapper_self.phase = ppo_roa.cfg.phase
+                wrapper_self.num_agents = ppo_roa.num_agents
+
+            def forward(wrapper_self, tensordict):
+                batch_size_total = tensordict.batch_size[0]
+                num_envs_per_agent = batch_size_total // wrapper_self.num_agents
+
+                # Collect outputs from each agent
+                action_list = []
+                sample_log_prob_list = []
+                loc_list = []
+                scale_list = []
+
+                # Optional outputs
+                adapt_hx_list = [] if self.cfg.adapt_module == "gru" else None
+                priv_pred_list = [] if self.cfg.phase == "finetune" else None
+                priv_est_list = [] if self.cfg.phase == "adapt_est" else None
+                dr_pred_list = [] if self.cfg.train_dr_estimator else None
+
+                for agent_id in range(wrapper_self.num_agents):
+                    # Extract agent's data using interleaved indexing
+                    agent_indices = torch.arange(agent_id, batch_size_total, wrapper_self.num_agents, device=tensordict.device)
+                    agent_td = tensordict[agent_indices].clone()
+
+                    # Forward through agent's networks based on phase
+                    if wrapper_self.phase == "train":
+                        agent_td = self.encoders_priv[agent_id](agent_td)
+                        agent_td = self.actors[agent_id](agent_td)
+                        agent_td = self.adapt_modules[agent_id](agent_td)
+                    elif wrapper_self.phase == "adapt":
+                        agent_td = self.adapt_modules[agent_id](agent_td)
+                        agent_td = self.actors_adapt[agent_id](agent_td)
+                    elif wrapper_self.phase == "finetune":
+                        agent_td = self.adapt_emas[agent_id](agent_td)
+                        agent_td = self.actors_adapt[agent_id](agent_td)
+                    elif wrapper_self.phase == "train_est":
+                        agent_td = self.adapt_emas[agent_id](agent_td)
+                        agent_td = self.actors_adapt[agent_id](agent_td)
+                    elif wrapper_self.phase == "adapt_est":
+                        agent_td = self.estimator(agent_td)  # Estimator is shared
+                        agent_td = self.actors_adapt[agent_id](agent_td)
+
+                    # Collect outputs
+                    action_list.append(agent_td["action"])
+                    sample_log_prob_list.append(agent_td["sample_log_prob"])
+                    loc_list.append(agent_td["loc"])
+                    scale_list.append(agent_td["scale"])
+
+                    # Collect optional outputs
+                    if adapt_hx_list is not None:
+                        adapt_hx_list.append(agent_td[("next", "adapt_hx")])
+                    if priv_pred_list is not None:
+                        priv_pred_list.append(agent_td[PRIV_PRED_KEY])
+                    if priv_est_list is not None:
+                        priv_est_list.append(agent_td["priv_est"])
+                    if dr_pred_list is not None and self.cfg.train_dr_estimator:
+                        agent_td = self.dr_estimator(agent_td)
+                        dr_pred_list.append(agent_td["dr_pred"])
+
+                # Interleave outputs back to flat batch
+                # Stack: [num_envs_per_agent, num_agents, ...] -> Reshape: [batch_size_total, ...]
+                tensordict["action"] = torch.stack(action_list, dim=1).reshape(batch_size_total, -1)
+                tensordict["sample_log_prob"] = torch.stack(sample_log_prob_list, dim=1).reshape(batch_size_total, -1)
+                tensordict["loc"] = torch.stack(loc_list, dim=1).reshape(batch_size_total, -1)
+                tensordict["scale"] = torch.stack(scale_list, dim=1).reshape(batch_size_total, -1)
+
+                # Interleave optional outputs
+                if adapt_hx_list is not None:
+                    tensordict[("next", "adapt_hx")] = torch.stack(adapt_hx_list, dim=1).reshape(batch_size_total, -1)
+                if priv_pred_list is not None:
+                    tensordict[PRIV_PRED_KEY] = torch.stack(priv_pred_list, dim=1).reshape(batch_size_total, -1)
+                if priv_est_list is not None:
+                    tensordict["priv_est"] = torch.stack(priv_est_list, dim=1).reshape(batch_size_total, -1)
+                if dr_pred_list is not None:
+                    tensordict["dr_pred"] = torch.stack(dr_pred_list, dim=1).reshape(batch_size_total, -1)
+
+                return tensordict
+
+        return MultiAgentPolicyWrapper(self)
+
+    # ============ State Dict Methods ============
+    def state_dict(self):
+        if self.num_agents == 1:
+            # Single agent: use existing logic
+            if self.cfg.phase == "train":
+                if not self.cfg.enable_residual_distillation:
+                    hard_copy_(self.actor, self.actor_adapt)
+                else:
+                    actor_std = self.actor.module[0][2].module.actor_std
+                    actor_adapt_std = self.actor_adapt.module[0][2].module.actor_std
+                    actor_adapt_std.data.copy_(actor_std.data)
+
+            if self.cfg.phase in ["train", "adapt"]:
+                hard_copy_(self.adapt_module, self.adapt_ema)
+
+            state_dict = OrderedDict()
+            for name, module in self.named_children():
+                state_dict[name] = module.state_dict()
+            state_dict["last_phase"] = self.cfg.phase
+            state_dict["last_iter"] = self.env.current_iter
+            state_dict["lr_policy"] = self.lr_policy
+            return state_dict
+        else:
+            # Multi-agent: save all agents' networks
+            if self.cfg.phase == "train":
+                for i in range(self.num_agents):
+                    if not self.cfg.enable_residual_distillation:
+                        hard_copy_(self.actors[i], self.actors_adapt[i])
+                    else:
+                        actor_std = self.actors[i].module[0][2].module.actor_std
+                        actor_adapt_std = self.actors_adapt[i].module[0][2].module.actor_std
+                        actor_adapt_std.data.copy_(actor_std.data)
+
+            if self.cfg.phase in ["train", "adapt"]:
+                for i in range(self.num_agents):
+                    hard_copy_(self.adapt_modules[i], self.adapt_emas[i])
+
+            state_dict = OrderedDict()
+            state_dict["num_agents"] = self.num_agents
+
+            # Save each agent's networks
+            for i in range(self.num_agents):
+                state_dict[f"agent{i}_encoder_priv"] = self.encoders_priv[i].state_dict()
+                state_dict[f"agent{i}_adapt_module"] = self.adapt_modules[i].state_dict()
+                state_dict[f"agent{i}_actor"] = self.actors[i].state_dict()
+                state_dict[f"agent{i}_actor_adapt"] = self.actors_adapt[i].state_dict()
+                state_dict[f"agent{i}_critic"] = self.critics[i].state_dict()
+                state_dict[f"agent{i}_adapt_ema"] = self.adapt_emas[i].state_dict()
+                state_dict[f"agent{i}_value_norm"] = self.value_norms[i].state_dict()
+
+            # Save shared modules (if any)
+            if self.cfg.phase in ["train_est", "adapt_est"]:
+                state_dict["estimator"] = self.estimator.state_dict()
+            if self.cfg.train_dr_estimator:
+                state_dict["dr_estimator"] = self.dr_estimator.state_dict()
+
+            state_dict["last_phase"] = self.cfg.phase
+            state_dict["last_iter"] = self.env.current_iter
+            state_dict["lr_policy"] = self.lr_policy
+            return state_dict
     
     def load_state_dict(self, state_dict, strict=True):
         succeed_keys = []
         failed_keys = []
-        for name, module in self.named_children():
-            _state_dict = state_dict.get(name, {})
-            try:
-                module.load_state_dict(_state_dict, strict=strict)
-                succeed_keys.append(name)
-            except Exception as e:
-                warnings.warn(f"Failed to load state dict for {name}: {str(e)}")
-                failed_keys.append(name)
-        print(f"Successfully loaded {succeed_keys}.")
 
+        # Check if this is a multi-agent checkpoint
+        checkpoint_num_agents = state_dict.get("num_agents", 1)
+
+        if checkpoint_num_agents == 1 and self.num_agents == 1:
+            # Single agent checkpoint → single agent model
+            for name, module in self.named_children():
+                _state_dict = state_dict.get(name, {})
+                try:
+                    module.load_state_dict(_state_dict, strict=strict)
+                    succeed_keys.append(name)
+                except Exception as e:
+                    warnings.warn(f"Failed to load state dict for {name}: {str(e)}")
+                    failed_keys.append(name)
+            print(f"Successfully loaded {succeed_keys}.")
+        elif checkpoint_num_agents > 1 and self.num_agents > 1:
+            # Multi-agent checkpoint → multi-agent model
+            if checkpoint_num_agents != self.num_agents:
+                warnings.warn(f"Checkpoint has {checkpoint_num_agents} agents, but model expects {self.num_agents}. Loading only matching agents.")
+
+            num_agents_to_load = min(checkpoint_num_agents, self.num_agents)
+
+            # Load each agent's networks
+            for i in range(num_agents_to_load):
+                try:
+                    self.encoders_priv[i].load_state_dict(state_dict[f"agent{i}_encoder_priv"], strict=strict)
+                    succeed_keys.append(f"agent{i}_encoder_priv")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_encoder_priv: {str(e)}")
+                    failed_keys.append(f"agent{i}_encoder_priv")
+
+                try:
+                    self.adapt_modules[i].load_state_dict(state_dict[f"agent{i}_adapt_module"], strict=strict)
+                    succeed_keys.append(f"agent{i}_adapt_module")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_adapt_module: {str(e)}")
+                    failed_keys.append(f"agent{i}_adapt_module")
+
+                try:
+                    self.actors[i].load_state_dict(state_dict[f"agent{i}_actor"], strict=strict)
+                    succeed_keys.append(f"agent{i}_actor")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_actor: {str(e)}")
+                    failed_keys.append(f"agent{i}_actor")
+
+                try:
+                    self.actors_adapt[i].load_state_dict(state_dict[f"agent{i}_actor_adapt"], strict=strict)
+                    succeed_keys.append(f"agent{i}_actor_adapt")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_actor_adapt: {str(e)}")
+                    failed_keys.append(f"agent{i}_actor_adapt")
+
+                try:
+                    self.critics[i].load_state_dict(state_dict[f"agent{i}_critic"], strict=strict)
+                    succeed_keys.append(f"agent{i}_critic")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_critic: {str(e)}")
+                    failed_keys.append(f"agent{i}_critic")
+
+                try:
+                    self.adapt_emas[i].load_state_dict(state_dict[f"agent{i}_adapt_ema"], strict=strict)
+                    succeed_keys.append(f"agent{i}_adapt_ema")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_adapt_ema: {str(e)}")
+                    failed_keys.append(f"agent{i}_adapt_ema")
+
+                try:
+                    self.value_norms[i].load_state_dict(state_dict[f"agent{i}_value_norm"], strict=strict)
+                    succeed_keys.append(f"agent{i}_value_norm")
+                except Exception as e:
+                    warnings.warn(f"Failed to load agent{i}_value_norm: {str(e)}")
+                    failed_keys.append(f"agent{i}_value_norm")
+
+            # Load shared modules
+            if self.cfg.phase in ["train_est", "adapt_est"] and "estimator" in state_dict:
+                try:
+                    self.estimator.load_state_dict(state_dict["estimator"], strict=strict)
+                    succeed_keys.append("estimator")
+                except Exception as e:
+                    warnings.warn(f"Failed to load estimator: {str(e)}")
+                    failed_keys.append("estimator")
+
+            if self.cfg.train_dr_estimator and "dr_estimator" in state_dict:
+                try:
+                    self.dr_estimator.load_state_dict(state_dict["dr_estimator"], strict=strict)
+                    succeed_keys.append("dr_estimator")
+                except Exception as e:
+                    warnings.warn(f"Failed to load dr_estimator: {str(e)}")
+                    failed_keys.append("dr_estimator")
+
+            print(f"Successfully loaded {len(succeed_keys)} multi-agent components.")
+        else:
+            # Mismatch: single vs multi-agent
+            raise ValueError(f"Cannot load checkpoint with {checkpoint_num_agents} agents into model with {self.num_agents} agents. Agent counts must match.")
+
+        # Load training progress and learning rate
         self.env.set_progress(state_dict.get("last_iter", 0))
         lr_policy = state_dict.get("lr_policy", None)
         if lr_policy is not None:
             self.lr_policy = lr_policy
-            for param_group in self.opt_policy.param_groups:
-                param_group["lr"] = self.lr_policy
+            if self.num_agents == 1:
+                for param_group in self.opt_policy.param_groups:
+                    param_group["lr"] = self.lr_policy
+            else:
+                for i in range(self.num_agents):
+                    for param_group in self.opt_policies[i].param_groups:
+                        param_group["lr"] = self.lr_policy
 
         return failed_keys

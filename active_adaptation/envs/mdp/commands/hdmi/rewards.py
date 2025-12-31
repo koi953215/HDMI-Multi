@@ -51,7 +51,7 @@ class _tracking_keypoint(TrackReward):
 
 class keypoint_pos_tracking_product(_tracking_keypoint):
     def compute(self):
-        body_pos_asset = self.command_manager.asset.data.body_link_pos_w[:, self.body_indices_asset]
+        body_pos_asset = self.command_manager.robot_body_pos_w[:, self.body_indices_motion]
         body_pos_motion = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
         diff = body_pos_motion - body_pos_asset
         # shape: [num_envs, num_tracking_bodies, 3]
@@ -61,7 +61,7 @@ class keypoint_pos_tracking_product(_tracking_keypoint):
 
 class keypoint_pos_tracking_local_product(_tracking_keypoint):
     def compute(self):
-        body_pos_asset = self.command_manager.asset.data.body_link_pos_w[:, self.body_indices_asset]
+        body_pos_asset = self.command_manager.robot_body_pos_w[:, self.body_indices_motion]
         body_pos_motion = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
 
         root_pos_asset = self.command_manager.robot_root_pos_w.clone()
@@ -89,7 +89,7 @@ class keypoint_pos_tracking_local_product(_tracking_keypoint):
         return torch.exp(- error.mean(dim=1) / self.sigma).unsqueeze(1)
 
     def debug_draw(self):
-        body_pos_asset = self.command_manager.asset.data.body_link_pos_w[:, self.body_indices_asset]
+        body_pos_asset = self.command_manager.robot_body_pos_w[:, self.body_indices_motion]
         body_pos_motion = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
 
         root_pos_asset = self.command_manager.robot_root_pos_w.clone()
@@ -134,7 +134,7 @@ class keypoint_pos_tracking_local_product(_tracking_keypoint):
 
 class keypoint_pos_error(_tracking_keypoint):
     def compute(self):
-        body_pos_asset = self.command_manager.asset.data.body_link_pos_w[:, self.body_indices_asset]
+        body_pos_asset = self.command_manager.robot_body_pos_w[:, self.body_indices_motion]
         body_pos_motion = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
         diff = body_pos_motion - body_pos_asset
         # shape: [num_envs, num_tracking_bodies, 3]
@@ -144,7 +144,7 @@ class keypoint_pos_error(_tracking_keypoint):
 
 class keypoint_pos_error_local(_tracking_keypoint):
     def compute(self):
-        body_pos_asset = self.command_manager.asset.data.body_link_pos_w[:, self.body_indices_asset]
+        body_pos_asset = self.command_manager.robot_body_pos_w[:, self.body_indices_motion]
         body_pos_motion = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
 
         root_pos_asset = self.command_manager.robot_root_pos_w.clone()
@@ -174,7 +174,7 @@ class keypoint_pos_error_local(_tracking_keypoint):
 
 class keypoint_ori_tracking_product(_tracking_keypoint):
     def compute(self):
-        body_ori_asset = self.command_manager.asset.data.body_quat_w[:, self.body_indices_asset]
+        body_ori_asset = self.command_manager.robot_body_quat_w[:, self.body_indices_motion]
         body_ori_motion = self.command_manager.ref_body_quat_w[:, self.body_indices_motion]
         diff = quat_mul(quat_conjugate(body_ori_motion), body_ori_asset)
         # shape: [num_envs, num_tracking_bodies, 4]
@@ -185,7 +185,7 @@ class keypoint_ori_tracking_product(_tracking_keypoint):
     
 class keypoint_ori_tracking_local_product(_tracking_keypoint):
     def compute(self):
-        body_ori_asset = self.command_manager.asset.data.body_quat_w[:, self.body_indices_asset]
+        body_ori_asset = self.command_manager.robot_body_quat_w[:, self.body_indices_motion]
         body_ori_motion = self.command_manager.ref_body_quat_w[:, self.body_indices_motion]
 
         root_quat_asset = self.command_manager.robot_root_quat_w
@@ -209,7 +209,7 @@ class keypoint_ori_tracking_local_product(_tracking_keypoint):
 
 class keypoint_ori_error(_tracking_keypoint):
     def compute(self):
-        body_ori_asset = self.command_manager.asset.data.body_quat_w[:, self.body_indices_asset]
+        body_ori_asset = self.command_manager.robot_body_quat_w[:, self.body_indices_motion]
         body_ori_motion = self.command_manager.ref_body_quat_w[:, self.body_indices_motion]
         diff = quat_mul(quat_conjugate(body_ori_motion), body_ori_asset)
         # shape: [num_envs, num_tracking_bodies, 4]
@@ -220,7 +220,7 @@ class keypoint_ori_error(_tracking_keypoint):
     
 class keypoint_ori_error_local(_tracking_keypoint):
     def compute(self):
-        body_ori_asset = self.command_manager.asset.data.body_quat_w[:, self.body_indices_asset]
+        body_ori_asset = self.command_manager.robot_body_quat_w[:, self.body_indices_motion]
         body_ori_motion = self.command_manager.ref_body_quat_w[:, self.body_indices_motion]
 
         root_quat_asset = self.command_manager.robot_root_quat_w
@@ -244,7 +244,7 @@ class keypoint_ori_error_local(_tracking_keypoint):
 
 class keypoint_lin_vel_tracking_product(_tracking_keypoint):
     def compute(self):
-        body_lin_vel_asset = self.command_manager.asset.data.body_com_lin_vel_w[:, self.body_indices_asset]
+        body_lin_vel_asset = self.command_manager.robot_body_lin_vel_w[:, self.body_indices_motion]
         body_lin_vel_motion = self.command_manager.ref_body_lin_vel_w[:, self.body_indices_motion]
         diff = body_lin_vel_motion - body_lin_vel_asset
         # shape: [num_envs, num_tracking_bodies, 3]
@@ -253,7 +253,7 @@ class keypoint_lin_vel_tracking_product(_tracking_keypoint):
         return torch.exp(- error.mean(dim=1) / self.sigma).unsqueeze(1)
 class keypoint_ang_vel_tracking_product(_tracking_keypoint):
     def compute(self):
-        body_ang_vel_asset = self.command_manager.asset.data.body_com_ang_vel_w[:, self.body_indices_asset]
+        body_ang_vel_asset = self.command_manager.robot_body_ang_vel_w[:, self.body_indices_motion]
         body_ang_vel_motion = self.command_manager.ref_body_ang_vel_w[:, self.body_indices_motion]
         diff = body_ang_vel_motion - body_ang_vel_asset
         # shape: [num_envs, num_tracking_bodies, 3]
@@ -297,7 +297,7 @@ class _tracking_joint(TrackReward):
 
 class joint_pos_tracking_product(_tracking_joint):
     def compute(self):
-        joint_pos_asset = self.command_manager.asset.data.joint_pos[:, self.joint_indices_asset]
+        joint_pos_asset = self.command_manager.robot_joint_pos[:, self.joint_indices_motion]
         joint_pos_motion = self.command_manager.ref_joint_pos[:, self.joint_indices_motion]
         diff = joint_pos_motion - joint_pos_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
@@ -306,7 +306,7 @@ class joint_pos_tracking_product(_tracking_joint):
     
 class joint_pos_error(_tracking_joint):
     def compute(self):
-        joint_pos_asset = self.command_manager.asset.data.joint_pos[:, self.joint_indices_asset]
+        joint_pos_asset = self.command_manager.robot_joint_pos[:, self.joint_indices_motion]
         joint_pos_motion = self.command_manager.ref_joint_pos[:, self.joint_indices_motion]
         diff = joint_pos_motion - joint_pos_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
@@ -314,7 +314,7 @@ class joint_pos_error(_tracking_joint):
     
 class joint_vel_tracking_product(_tracking_joint):
     def compute(self):
-        joint_vel_asset = self.command_manager.asset.data.joint_vel[:, self.joint_indices_asset]
+        joint_vel_asset = self.command_manager.robot_joint_vel[:, self.joint_indices_motion]
         joint_vel_motion = self.command_manager.ref_joint_vel[:, self.joint_indices_motion]
         diff = joint_vel_motion - joint_vel_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
@@ -376,8 +376,10 @@ class eef_contact_exp(RobotObjectTrackReward):
     ):
         super().__init__(**kwargs)
         self.gain = gain
-        self.eef_pos_error = torch.zeros(self.num_envs, self.command_manager.num_eefs, device=self.device)
-        self.eef_frc = torch.zeros(self.num_envs, self.command_manager.num_eefs, 3, device=self.device)
+        # Multi-agent: use batch_size_total instead of num_envs
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        self.eef_pos_error = torch.zeros(batch_size_total, self.command_manager.num_eefs, device=self.device)
+        self.eef_frc = torch.zeros(batch_size_total, self.command_manager.num_eefs, 3, device=self.device)
 
         self.pos_sigma = pos_sigma
         self.pos_tolerance = pos_tolerance
@@ -417,9 +419,11 @@ class eef_contact_exp_max(RobotObjectTrackReward):
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.eef_pos_error = torch.zeros(self.num_envs, self.command_manager.num_eefs, device=self.device)
-        self.eef_ori_error = torch.zeros(self.num_envs, self.command_manager.num_eefs, 3, device=self.device)
-        self.eef_frc = torch.zeros(self.num_envs, self.command_manager.num_eefs, 3, device=self.device)
+        # Multi-agent: use batch_size_total instead of num_envs
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        self.eef_pos_error = torch.zeros(batch_size_total, self.command_manager.num_eefs, device=self.device)
+        self.eef_ori_error = torch.zeros(batch_size_total, self.command_manager.num_eefs, 3, device=self.device)
+        self.eef_frc = torch.zeros(batch_size_total, self.command_manager.num_eefs, 3, device=self.device)
 
         self.pos_sigma = pos_sigma
         self.pos_tolerance = pos_tolerance
@@ -459,9 +463,11 @@ class eef_contact_all(RobotObjectTrackReward):
     ):
         super().__init__(**kwargs)
         self.gain = gain
-        self.eef_pos_error = torch.zeros(self.num_envs, 2, device=self.device)
-        self.eef_ori_error = torch.zeros(self.num_envs, 2, 3, device=self.device)
-        self.eef_frc = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        # Multi-agent: use batch_size_total instead of num_envs
+        batch_size_total = getattr(self.env, 'batch_size_total', self.num_envs)
+        self.eef_pos_error = torch.zeros(batch_size_total, 2, device=self.device)
+        self.eef_ori_error = torch.zeros(batch_size_total, 2, 3, device=self.device)
+        self.eef_frc = torch.zeros(batch_size_total, 2, 3, device=self.device)
 
         self.pos_thres = pos_thres
         self.frc_thres = frc_thres
