@@ -271,3 +271,7 @@ termination:
   cum_object_ori_error:     {min_steps: 25, threshold: 0.8}
 
   cum_lost_contact_steps:   {min_steps: 25, pos_thres: 0.2, frc_thres: 1.0}
+
+# Multi-agent iPPO: sync algo.num_agents with task.num_agents
+algo:
+  num_agents: ${task.num_agents}
