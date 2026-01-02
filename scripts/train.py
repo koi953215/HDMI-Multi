@@ -118,6 +118,40 @@ def main(cfg: DictConfig):
     carry = env.reset()
     rollout_policy: TensorDictModuleBase = policy.get_rollout_policy("train")
 
+    # Create critic wrapper (supports both single-agent and multi-agent)
+    if hasattr(policy, 'num_agents') and policy.num_agents > 1:
+        # Multi-agent: create critic wrapper
+        class MultiAgentCriticWrapper:
+            def __init__(self, ppo_policy):
+                self.policy = ppo_policy
+                self.num_agents = ppo_policy.num_agents
+
+            def __call__(self, tensordict):
+                """
+                Compute state values for all agents and interleave back.
+                """
+                batch_size_total = tensordict.batch_size[0]
+                value_list = []
+
+                for agent_id in range(self.num_agents):
+                    # Extract agent's data using interleaved indexing
+                    agent_indices = torch.arange(agent_id, batch_size_total, self.num_agents, device=tensordict.device)
+                    agent_td = tensordict[agent_indices].clone()
+
+                    # Compute values using agent's critic
+                    agent_td = self.policy.critics[agent_id](agent_td)
+                    value_list.append(agent_td["state_value"])
+
+                # Interleave values back: [num_envs_per_agent, num_agents, ...] -> [batch_size_total, ...]
+                values = torch.stack(value_list, dim=1).reshape(batch_size_total, -1)
+                tensordict["state_value"] = values
+                return tensordict
+
+        critic_fn = MultiAgentCriticWrapper(policy)
+    else:
+        # Single-agent: use existing critic directly
+        critic_fn = policy.critic
+
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
         tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
@@ -152,12 +186,12 @@ def main(cfg: DictConfig):
                 td, carry = env.step_and_maybe_reset(carry)
                 td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
                 data_buf[:, step] = td
-            policy.critic(data_buf)
+            critic_fn(data_buf)
             values = data_buf["state_value"]
             data_buf["next", "state_value"] = torch.where(
                 data_buf["next", "done"],
                 values, # a walkaround to avoid storing the next states
-                torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
+                torch.cat([values[:, 1:], critic_fn(carry.copy())["state_value"].unsqueeze(1)], dim=1)
             )
         rollout_time = time.perf_counter() - rollout_start
 
