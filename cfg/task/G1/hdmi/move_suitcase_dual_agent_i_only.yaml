@@ -8,16 +8,12 @@ name: G1TrackSuitcase
 # Multi-agent configuration
 num_agents: 2  # Two independent agents with separate datasets
 
-# CRITICAL: Must also set algo.num_agents to override PPOConfig default
-algo:
-  num_agents: 2
-
 # Special termination mode: Only agent_i can trigger environment reset
 # All other agents inherit agent_i's termination status
 # Set to integer (0, 1, ...) to specify which agent controls termination
 # Set to null/comment out to disable (all agents can trigger reset independently)
 # Use this for debugging to test if specific agent has issues
-agent_i_only_termination: 1  # Change to 0 or 1 to test different agents
+agent_i_only_termination: 0
 
 viewer:
   # show retarget motion
