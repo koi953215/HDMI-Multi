@@ -473,18 +473,31 @@ class _Env(EnvBase):
         flags = torch.cat(flags, dim=-1)
         terminated = flags.any(dim=-1, keepdim=True)  # [batch_size_total, 1]
 
-        # Multi-agent: Only agent_0 can trigger termination (special mode)
-        if self.num_agents > 1 and self.cfg.get("agent0_only_termination", False):
-            # Extract agent_0's termination status for each physical environment
-            # Interleaved ordering: [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
-            # Agent 0 indices: [0, 2, 4, ...] = [0::num_agents]
-            agent0_indices = torch.arange(0, self.batch_size_total, self.num_agents, device=self.device)
-            agent0_terminated = terminated[agent0_indices]  # [num_envs_per_agent, 1]
+        # Multi-agent: Only agent_i can trigger termination (special mode for debugging)
+        if self.num_agents > 1:
+            # Check for new flexible agent_i_only_termination parameter
+            agent_i = self.cfg.get("agent_i_only_termination", None)
 
-            # Broadcast agent_0's status to all agents in the same environment
-            # Each agent_0 status repeats num_agents times: [ag0_env0, ag0_env0, ag0_env1, ag0_env1, ...]
-            terminated_broadcast = agent0_terminated.repeat_interleave(self.num_agents, dim=0)  # [batch_size_total, 1]
-            terminated = terminated_broadcast
+            # Backward compatibility: check old agent0_only_termination parameter
+            if agent_i is None and self.cfg.get("agent0_only_termination", False):
+                agent_i = 0
+
+            if agent_i is not None and isinstance(agent_i, int) and 0 <= agent_i < self.num_agents:
+                # [DEBUG_TERM] Print termination mode (only once)
+                if not hasattr(self, '_debug_term_printed'):
+                    print(f"[DEBUG_TERM] Using agent_{agent_i}_only termination mode")
+                    self._debug_term_printed = True
+
+                # Extract agent_i's termination status for each physical environment
+                # Interleaved ordering: [env0_ag0, env0_ag1, env1_ag0, env1_ag1, ...]
+                # Agent i indices: [i, i+num_agents, i+2*num_agents, ...] = [i::num_agents]
+                agent_i_indices = torch.arange(agent_i, self.batch_size_total, self.num_agents, device=self.device)
+                agent_i_terminated = terminated[agent_i_indices]  # [num_envs_per_agent, 1]
+
+                # Broadcast agent_i's status to all agents in the same environment
+                # Each agent_i status repeats num_agents times: [agi_env0, agi_env0, agi_env1, agi_env1, ...]
+                terminated_broadcast = agent_i_terminated.repeat_interleave(self.num_agents, dim=0)  # [batch_size_total, 1]
+                terminated = terminated_broadcast
 
         end = time.perf_counter()
         self.termination_time = self.termination_time * self._stats_ema_decay + (end - start)
